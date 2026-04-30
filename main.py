@@ -9,6 +9,7 @@ import threading
 import uuid
 import hashlib
 import math
+import subprocess
 from typing import Optional, Dict, List, Any
 from urllib.parse import urlparse, urljoin
 
@@ -146,6 +147,27 @@ def edit_reply_markup(chat_id: int, message_id: int, reply_markup: dict) -> Opti
         return None
 
 # ---------------------------------------------------------------------------
+#  اطلاعات سرور (برای ادمین)
+# ---------------------------------------------------------------------------
+def get_server_info() -> str:
+    try:
+        mem = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
+        disk = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
+        uptime_proc = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
+        parts = [
+            "📊 اطلاعات سرور:",
+            "حافظه:",
+            mem.stdout.strip() if mem.returncode == 0 else "ناموفق",
+            "دیسک:",
+            disk.stdout.strip() if disk.returncode == 0 else "ناموفق",
+            "آپ‌تایم:",
+            uptime_proc.stdout.strip() if uptime_proc.returncode == 0 else "ناموفق",
+        ]
+        return "\n".join(parts)
+    except Exception as e:
+        return f"خطا در دریافت اطلاعات: {e}"
+
+# ---------------------------------------------------------------------------
 #  مدیریت خزنده (Job Handler اضافی)
 # ---------------------------------------------------------------------------
 def _crawler_job_handler(job: dict):
@@ -228,37 +250,8 @@ def handle_message(chat_id: int, text: str):
         worker.send_message(chat_id, "⏹️ عملیات لغو شد.", reply_markup=main_menu_keyboard(is_admin, session.get("subscription", "free")))
         return
 
-    # ---------- فرمان‌های ادمین ----------
+    # ---------- فرمان‌های ادمین (فقط همین دو) ----------
     if is_admin:
-        if text.startswith("/addcode "):
-            parts = text.split()
-            if len(parts) == 3:
-                code, level = parts[1], parts[2]
-                subs = storage.load_subscriptions()
-                if level in subs["valid_codes"]:
-                    subs["valid_codes"][level].append(code)
-                    storage.save_subscriptions(subs)
-                    worker.send_message(chat_id, f"✅ کد {code} به اشتراک {level} افزوده شد.")
-                else:
-                    worker.send_message(chat_id, "❌ سطح نامعتبر.")
-            else:
-                worker.send_message(chat_id, "کاربرد: /addcode <کد> <سطح>")
-            return
-        if text.startswith("/removecode "):
-            code = text.split(maxsplit=1)[1].strip()
-            subs = storage.load_subscriptions()
-            removed = False
-            for level in subs["valid_codes"]:
-                if code in subs["valid_codes"][level]:
-                    subs["valid_codes"][level].remove(code)
-                    removed = True
-                    break
-            if removed:
-                storage.save_subscriptions(subs)
-                worker.send_message(chat_id, f"✅ کد {code} حذف شد.")
-            else:
-                worker.send_message(chat_id, "❌ کدی یافت نشد.")
-            return
         if text == "/toggleservice":
             if service_disabled:
                 os.remove(SERVICE_DISABLED_FLAG)
@@ -268,35 +261,9 @@ def handle_message(chat_id: int, text: str):
                     f.write("disabled")
                 worker.send_message(chat_id, "🔴 سرویس غیرفعال شد.")
             return
-        if text.startswith("/admin_ban "):
-            parts = text.split()
-            if len(parts) >= 2:
-                target_id = int(parts[1])
-                duration = None
-                if len(parts) >= 3 and parts[2].lower() != "forever":
-                    duration = int(parts[2])
-                storage.ban_user(target_id, duration)
-                worker.send_message(chat_id, f"🚫 کاربر {target_id} مسدود شد.")
-            else:
-                worker.send_message(chat_id, "کاربرد: /admin_ban <شناسه> [مدت(دقیقه)]")
-            return
-        if text.startswith("/admin_unban "):
-            parts = text.split()
-            if len(parts) == 2:
-                target_id = int(parts[1])
-                if storage.unban_user(target_id):
-                    worker.send_message(chat_id, f"✅ کاربر {target_id} رفع مسدودیت شد.")
-                else:
-                    worker.send_message(chat_id, "❌ کاربر بن نبود.")
-            return
-        if text == "/admin_users":
-            subs = storage.load_subscriptions()
-            users = list(subs.get("user_levels", {}).items())
-            if not users:
-                worker.send_message(chat_id, "هیچ کاربری ثبت نشده.")
-                return
-            msg = "\n".join(f"{uid}: {lv}" for uid, lv in users[:50])
-            worker.send_message(chat_id, f"کاربران:\n{msg}")
+        if text == "/serverinfo":
+            info = get_server_info()
+            worker.send_message(chat_id, info)
             return
 
     # ---------- فعال‌سازی کد اشتراک (کاربران عادی) ----------
@@ -408,23 +375,77 @@ def handle_message(chat_id: int, text: str):
         worker.send_message(chat_id, summary, reply_markup=kb)
         return
 
+    elif state == "waiting_interactive_text":
+        # کاربر بعد از زدن /t... متن را وارد کرده است
+        job_id = session.pop("pending_interactive_job_id", None)
+        if not job_id:
+            worker.send_message(chat_id, "⛔ درخواست کاوشگر منقضی شده است.")
+            session["state"] = "idle"
+            storage.set_session(chat_id, session)
+            return
+
+        job = storage.find_job(QUEUE_FILE, job_id)
+        if not job:
+            worker.send_message(chat_id, "⛔ کار کاوشگر یافت نشد.")
+            session["state"] = "idle"
+            storage.set_session(chat_id, session)
+            return
+
+        job["extra"]["user_text"] = text
+        job["status"] = "queued"
+        storage.update_job(QUEUE_FILE, job)
+        worker.send_message(chat_id, "✅ متن دریافت شد. در حال اجرای کاوشگر...")
+        session["state"] = "idle"
+        storage.set_session(chat_id, session)
+        return
+
     elif state == "browsing":
         cmd_map = session.get("text_links", {})
+
+        # ۱. بررسی /t (کاوشگر تعاملی)
+        if text.startswith("/t") and text in cmd_map:
+            element_index = cmd_map[text]   # یک عدد ذخیره شده (string)
+            job = {
+                "job_id": uuid.uuid4().hex,
+                "chat_id": chat_id,
+                "url": session.get("browser_url", ""),
+                "mode": "interactive_execute",
+                "status": "queued",
+                "created_at": time.time(),
+                "extra": {
+                    "element_index": int(element_index),
+                    "user_text": ""
+                }
+            }
+            storage.enqueue_job(QUEUE_FILE, job)
+            session["pending_interactive_job_id"] = job["job_id"]
+            session["state"] = "waiting_interactive_text"
+            storage.set_session(chat_id, session)
+            worker.send_message(chat_id, "📝 متن مورد نظر برای این فیلد را وارد کنید:")
+            return
+
+        # ۲. دستورات /d, /o, /H, /a
         if text in cmd_map:
             url = cmd_map[text]
+            if text.startswith("/d") or text.startswith("/o"):
+                mode = "download"
+            else:
+                mode = "browser"
+
             job = {
                 "job_id": uuid.uuid4().hex,
                 "chat_id": chat_id,
                 "url": url,
-                "mode": "browser",
+                "mode": mode,
                 "status": "queued",
                 "created_at": time.time(),
             }
             storage.enqueue_job(QUEUE_FILE, job)
-            worker.send_message(chat_id, "🔗 در حال باز کردن...")
+            worker.send_message(chat_id, "🔗 در حال پردازش...")
             session["state"] = "idle"
             storage.set_session(chat_id, session)
             return
+
         worker.send_message(chat_id, "⛔ از دکمه‌ها استفاده کنید یا /cancel")
         return
 
@@ -526,13 +547,8 @@ def handle_callback(cq: dict):
             worker.answer_callback_query(cq_id, "دسترسی ندارید", show_alert=True)
             return
         admin_kb = {"inline_keyboard": [
-            [{"text": "➕ افزودن کد", "callback_data": "admin_addcode"}],
-            [{"text": "🔐 حذف کد", "callback_data": "admin_removecode"}],
-            [{"text": "🚫 بن کاربر", "callback_data": "admin_ban"}],
-            [{"text": "✅ رفع بن", "callback_data": "admin_unban"}],
-            [{"text": "👥 کاربران", "callback_data": "admin_users"}],
-            [{"text": "🔧 سرویس", "callback_data": "admin_toggleservice"}],
-            [{"text": "❌ خاموش", "callback_data": "admin_kill"}],
+            [{"text": "📊 منابع سرور", "callback_data": "admin_server_info"}],
+            [{"text": "🔄 تغییر وضعیت سرویس", "callback_data": "admin_toggleservice"}],
             [{"text": "🔙 بازگشت", "callback_data": "back_main"}],
         ]}
         worker.send_message(chat_id, "🛠️ پنل ادمین:", reply_markup=admin_kb)
@@ -687,11 +703,9 @@ def handle_callback(cq: dict):
 
     # ---------- عملیات مرورگر ----------
     elif data.startswith("nav_") or data.startswith("dlvid_"):
-        parts = data.split("_")
-        idx = int(parts[2])
-        urls = session.get("_callback_urls", {})
-        if data in urls:
-            url = urls[data]
+        # مستقیماً از _callback_urls ذخیره‌شده استفاده کن
+        url = session.get("_callback_urls", {}).get(data)
+        if url:
             mode = "browser" if data.startswith("nav_") else "download"
             job = {
                 "job_id": uuid.uuid4().hex,
@@ -703,6 +717,8 @@ def handle_callback(cq: dict):
             }
             storage.enqueue_job(QUEUE_FILE, job)
             worker.answer_callback_query(cq_id, "در صف قرار گرفت")
+        else:
+            worker.answer_callback_query(cq_id, "لینک یافت نشد", show_alert=True)
         return
     elif data.startswith("bpg_"):
         parts = data.split("_")
@@ -890,45 +906,20 @@ def handle_callback(cq: dict):
             storage.enqueue_job(QUEUE_FILE, new_job)
         return
 
-    # -------- ادمین ----------
-    elif data == "admin_addcode":
-        session["state"] = "admin_wait_code"
-        storage.set_session(chat_id, session)
-        worker.send_message(chat_id, "کد و سطح را به صورت <کد> <سطح> وارد کنید:")
-        return
-    elif data == "admin_removecode":
-        session["state"] = "admin_wait_removecode"
-        storage.set_session(chat_id, session)
-        worker.send_message(chat_id, "کد را وارد کنید:")
-        return
-    elif data == "admin_ban":
-        session["state"] = "admin_wait_ban"
-        storage.set_session(chat_id, session)
-        worker.send_message(chat_id, "شناسه کاربر و مدت (دقیقه یا forever):")
-        return
-    elif data == "admin_unban":
-        session["state"] = "admin_wait_unban"
-        storage.set_session(chat_id, session)
-        worker.send_message(chat_id, "شناسه کاربر:")
+    # -------- ادمین (ساده شده) ----------
+    elif data == "admin_server_info":
+        info = get_server_info()
+        worker.send_message(chat_id, info)
+        worker.answer_callback_query(cq_id, "اطلاعات دریافت شد")
         return
     elif data == "admin_toggleservice":
         if os.path.exists(SERVICE_DISABLED_FLAG):
             os.remove(SERVICE_DISABLED_FLAG)
-            worker.answer_callback_query(cq_id, "سرویس فعال شد")
+            worker.answer_callback_query(cq_id, "✅ سرویس فعال شد")
         else:
             with open(SERVICE_DISABLED_FLAG, "w") as f:
                 f.write("1")
-            worker.answer_callback_query(cq_id, "سرویس غیرفعال شد")
-        return
-    elif data == "admin_kill":
-        worker.answer_callback_query(cq_id, "خاموش کردن...")
-        stop_event.set()
-        return
-    elif data == "admin_users":
-        subs = storage.load_subscriptions()
-        users = list(subs.get("user_levels", {}).items())
-        msg = "\n".join(f"{uid}: {lv}" for uid, lv in users[:50]) or "خالی"
-        worker.send_message(chat_id, f"کاربران:\n{msg}")
+            worker.answer_callback_query(cq_id, "🔴 سرویس غیرفعال شد")
         return
 
     # دکمه‌های صفحه‌بندی دانلودهای پیدا شده (مثلاً dfpg_)
