@@ -254,8 +254,11 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
             cb = f"dlvid_{chat_id}_{global_idx}"
         else:
             cb = f"nav_{chat_id}_{global_idx}"
-        callback_urls[cb] = link["href"]
-        text = (link.get("text") or "")[:20] or link["href"][:20]
+        href = link.get("href", "")
+        if not isinstance(href, str):
+            href = str(href)
+        callback_urls[cb] = href
+        text = (link.get("text") or "")[:20] or href[:20]
         row.append({"text": text, "callback_data": cb})
         if len(row) == 2:
             keyboard_rows.append(row)
@@ -755,10 +758,11 @@ def _send_file_parts(chat_id: int, file_path: str, use_zip: bool, label: str = "
     ارسال فایل به صورت قطعه‌قطعه (با توجه به ZIP_PART_SIZE و نوع تحویل).
     """
     if use_zip:
-        base = os.path.splitext(file_path)[0]
+        base = os.path.splitext(os.path.basename(file_path))[0]
         parts = create_zip_and_split(file_path, base)
     else:
-        base, ext = os.path.splitext(file_path)
+        base, ext = os.path.splitext(os.path.basename(file_path))
+        ext = ext if ext else ".bin"
         parts = split_file_binary(file_path, base, ext)
 
     for part_path in parts:
@@ -859,6 +863,11 @@ def process_download_execute(job: dict) -> None:
             raise Exception("no file")
 
         # ارسال با توجه به pack_zip
+        if not os.path.isfile(final_file):
+            worker.send_message(chat_id, "❌ فایل نهایی یافت نشد.")
+            _done_job(job)
+            return
+
         if pack_zip:
             _send_file_parts(chat_id, final_file, use_zip=True, label=fname)
         else:
@@ -928,6 +937,7 @@ def download_full_website(job: dict) -> None:
 
     except Exception:
         # fallback: Playwright
+        worker.send_message(chat_id, "wget در دسترس نیست، تلاش با مرورگر...")
         try:
             context = get_or_create_context(chat_id, incognito=False)
             page = context.new_page()
@@ -944,7 +954,7 @@ def download_full_website(job: dict) -> None:
             _send_file_parts(chat_id, zip_path, use_zip=False, label="Website (fallback)")
             _done_job(job)
         except Exception as e:
-            worker.send_message(chat_id, f"❌ خطا در دانلود سایت: {e}")
+            worker.send_message(chat_id, f"❌ دانلود سایت ناموفق بود. ممکن است سایت در دسترس نباشد. ({e})")
             job["status"] = "failed"
             storage.update_job(QUEUE_FILE, job)
         finally:
@@ -1029,10 +1039,13 @@ def process_record_job(job: dict) -> None:
 
         # ارسال ویدیو
         video_zip = (video_delivery == "zip")
-        _send_file_parts(chat_id, final_video_path, use_zip=video_zip, label="🎬 ویدیو")
+        if os.path.isfile(final_video_path):
+            _send_file_parts(chat_id, final_video_path, use_zip=video_zip, label="🎬 ویدیو")
+        else:
+            worker.send_message(chat_id, "❌ فایل ویدیو نهایی یافت نشد.")
 
         # ارسال صدا
-        if audio_ok:
+        if audio_ok and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
             _send_file_parts(chat_id, audio_path, use_zip=video_zip, label="🎵 صوت")
 
         _done_job(job, RECORD_QUEUE_FILE)
@@ -1152,8 +1165,11 @@ def handle_scan_videos(job: dict) -> None:
                 cmds.append(cmd)
                 session.setdefault("text_links", {})[cmd] = v["url"]
             storage.set_session(chat_id, session)
-            msg = "🎬 ویدیوهای یافت شده:\n" + "\n".join(f"{cmd}: {v['url']}" for cmd, v in zip(cmds, videos[:20]))
-            worker.send_message(chat_id, msg)
+            msg_lines = []
+            for v, cmd in zip(videos[:20], cmds):
+                url_short = v["url"][:60]
+                msg_lines.append(f"{cmd}: {url_short}")
+            worker.send_message(chat_id, "🎬 ویدیوهای یافت شده:\n" + "\n".join(msg_lines))
         _done_job(job)
     except Exception as e:
         worker.send_message(chat_id, f"❌ خطا در اسکن ویدیو: {e}")
@@ -1173,7 +1189,12 @@ def handle_extract_commands(job: dict) -> None:
         cmds.append(cmd)
         session.setdefault("text_links", {})[cmd] = link["href"]
     storage.set_session(chat_id, session)
-    worker.send_message(chat_id, "دستورات مستقیم:\n" + "\n".join(cmds))
+
+    lines = []
+    for link, cmd in zip(all_links, cmds):
+        text = (link.get("text") or link["href"])[:40]
+        lines.append(f"{cmd}: {text}")
+    worker.send_message(chat_id, "دستورات مستقیم:\n" + "\n".join(lines))
     _done_job(job)
 
 
@@ -1197,8 +1218,12 @@ def handle_smart_analyze(job: dict) -> None:
             cmd = f"/H{h}"
             cmds.append(cmd)
             session.setdefault("text_links", {})[cmd] = item["href"]
-        worker.send_message(chat_id, f"{cat_name}:\n" + "\n".join(cmds))
-    storage.set_session(chat_id, session)
+        storage.set_session(chat_id, session)
+        lines = []
+        for item, cmd in zip(items, cmds):
+            text = (item.get("text") or item["href"])[:30]
+            lines.append(f"{cmd}: {text}")
+        worker.send_message(chat_id, f"{cat_name}:\n" + "\n".join(lines))
     _done_job(job)
 
 
@@ -1228,13 +1253,15 @@ def handle_source_analyze(job: dict) -> None:
                 for m in matches:
                     urls.add(m)
         cmds = []
-        for u in urls:
+        url_list = list(urls)
+        for u in url_list[:30]:
             h = hashlib.md5(u.encode()).hexdigest()[:8]
             cmd = f"/H{h}"
             cmds.append(cmd)
             session.setdefault("text_links", {})[cmd] = u
         storage.set_session(chat_id, session)
-        worker.send_message(chat_id, "لینک‌های استخراج شده:\n" + "\n".join(cmds[:30]))
+        lines = [f"{cmd}: {u[:40]}" for cmd, u in zip(cmds, url_list[:30])]
+        worker.send_message(chat_id, "لینک‌های استخراج شده:\n" + "\n".join(lines))
         _done_job(job)
     except Exception as e:
         worker.send_message(chat_id, f"❌ خطا در تحلیل سورس: {e}")
@@ -1309,6 +1336,8 @@ def process_captcha_job(job: dict) -> None:
         _done_job(job)
         return
 
+    job_dir = f"jobs/{job['job_id']}"
+    os.makedirs(job_dir, exist_ok=True)
     context = get_or_create_context(chat_id, incognito=False)
     page = context.new_page()
     try:
@@ -1319,14 +1348,30 @@ def process_captcha_job(job: dict) -> None:
             document.querySelectorAll('button, input[type="submit"], a[href*="download"]').forEach(el => el.click());
         """)
         page.wait_for_timeout(3000)
-        # شنیدن پاسخ‌ها  (ساده شده)
-        worker.send_message(chat_id, "🪟 کپچا بررسی شد.")
+
+        spath = os.path.join(job_dir, "captcha_result.png")
+        page.screenshot(path=spath, full_page=True)
+
+        mode = session["settings"].get("browser_mode", "text")
+        links, video_urls = extract_links(page, mode)
+
+        session["state"] = "browsing"
+        session["browser_url"] = page.url
+        session["browser_links"] = (
+            [{"type": t, "text": txt, "href": href} for t, txt, href in links]
+            + [{"type": "video", "text": "🎬 ویدیو", "href": v} for v in video_urls]
+        )
+        session["browser_page"] = 0
+        storage.set_session(chat_id, session)
+
+        send_browser_page(chat_id, spath, session["browser_url"], 0)
         _done_job(job)
     except Exception as e:
-        worker.send_message(chat_id, f"❌ خطا: {e}")
+        worker.send_message(chat_id, f"❌ خطا در حل کپچا: {e}")
         _done_job(job)
     finally:
         page.close()
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def process_fullpage_screenshot(job: dict) -> None:
