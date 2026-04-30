@@ -31,6 +31,21 @@ os.makedirs("jobs", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
 # ---------------------------------------------------------------------------
+# ابزار ویرایش پیام (چون worker.py ندارد)
+# ---------------------------------------------------------------------------
+def edit_message_text(chat_id: int, message_id: int, text: str, reply_markup=None) -> Optional[dict]:
+    url = f"{API_BASE}/editMessageText"
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        return resp.json()
+    except Exception as e:
+        safe_log(f"editMessageText failed: {e}")
+        return None
+
+# ---------------------------------------------------------------------------
 # توابع کمکی برای ترجمهٔ مقادیر به فارسی
 # ---------------------------------------------------------------------------
 def translate_dlmode(mode: str) -> str:
@@ -59,6 +74,9 @@ def main_menu_keyboard(is_admin: bool, subscription: str) -> dict:
     ]
     if is_admin:
         kb.append([{"text": "🛠️ پنل ادمین", "callback_data": "menu_admin"}])
+    # ★ Torrent برای pro/admin
+    if is_admin or subscription in ("pro",):
+        kb.append([{"text": "🧲 تورنت", "callback_data": "menu_torrent"}])
     kb.append([{"text": "🕸️ خزنده وحشی", "callback_data": "menu_crawler"}])
     return {"inline_keyboard": kb}
 
@@ -228,6 +246,7 @@ def handle_message(chat_id: int, text: str):
         session.pop("browser_url", None)
         session.pop("interactive_elements", None)
         session.pop("crawler_pending_url", None)
+        session.pop("status_message_id", None)   # ★ پاکسازی
         storage.set_session(chat_id, session)
 
         sub = session.get("subscription", "free")
@@ -246,6 +265,7 @@ def handle_message(chat_id: int, text: str):
         session.pop("browser_url", None)
         session.pop("interactive_elements", None)
         session.pop("crawler_pending_url", None)
+        session.pop("status_message_id", None)   # ★ پاکسازی
         storage.set_session(chat_id, session)
         worker.send_message(chat_id, "⏹️ عملیات لغو شد.", reply_markup=main_menu_keyboard(is_admin, session.get("subscription", "free")))
         return
@@ -282,10 +302,12 @@ def handle_message(chat_id: int, text: str):
     # ---------- پردازش بر اساس وضعیت ----------
     state = session.get("state", "idle")
 
-    if state in ("waiting_url_screenshot", "waiting_url_download", "waiting_url_browser", "waiting_url_record"):
-        if not is_valid_url(text):
+    # حالت‌هایی که یک لینک دریافت می‌کنند و Job می‌سازند
+    if state in ("waiting_url_screenshot", "waiting_url_download", "waiting_url_browser", "waiting_url_record", "waiting_url_torrent"):
+        if not is_valid_url(text) and not (state == "waiting_url_torrent" and text.startswith("magnet:?")):
             worker.send_message(chat_id, "⛔ لینک نامعتبر است.")
             return
+
         job = {
             "job_id": uuid.uuid4().hex,
             "chat_id": chat_id,
@@ -294,27 +316,40 @@ def handle_message(chat_id: int, text: str):
             "created_at": time.time(),
             "updated_at": time.time(),
         }
+
+        # پیام وضعیت
+        status_text = ""
+        target_file = QUEUE_FILE
         if state == "waiting_url_screenshot":
             job["mode"] = "screenshot"
-            target_file = QUEUE_FILE
+            status_text = f"📸 درحال اسکرین‌شات از {text}"
         elif state == "waiting_url_download":
             job["mode"] = "download"
-            target_file = QUEUE_FILE
+            status_text = f"📥 درحال بررسی لینک و آماده‌سازی دانلود..."
         elif state == "waiting_url_browser":
             job["mode"] = "browser"
-            target_file = QUEUE_FILE
-        else:  # record
+            status_text = f"🔄 درحال مرورگر: باز کردن {text}"
+        elif state == "waiting_url_record":
             job["mode"] = "record_video"
-            job["extra"] = {
-                "live_scroll": session["settings"]["record_behavior"] == "live"
-            }
             target_file = RECORD_QUEUE_FILE
+            job["extra"] = {"live_scroll": session["settings"]["record_behavior"] == "live"}
+            rec_time = session["settings"].get("record_time", 20)
+            res = session["settings"].get("video_resolution", "720p")
+            status_text = f"🎬 درحال ضبط ویدیو با کیفیت {res} و زمان {rec_time} ثانیه..."
+        elif state == "waiting_url_torrent":
+            job["mode"] = "torrent"
+            status_text = "🧲 درحال دانلود تورنت..."
+
+        # ارسال پیام وضعیت و ذخیره message_id
+        status_msg = worker.send_message(chat_id, status_text)
+        if status_msg and status_msg.get("ok") and "result" in status_msg:
+            session["status_message_id"] = status_msg["result"]["message_id"]
 
         storage.enqueue_job(target_file, job)
         session["state"] = "idle"
         storage.set_session(chat_id, session)
-        worker.send_message(chat_id, "✅ کار در صف قرار گرفت.",
-                            reply_markup=main_menu_keyboard(is_admin, session.get("subscription", "free")))
+        # ★ بدون منوی اصلی
+        worker.send_message(chat_id, "✅ کار در صف قرار گرفت.")
         return
 
     elif state == "waiting_record_time":
@@ -365,7 +400,7 @@ def handle_message(chat_id: int, text: str):
             worker.send_message(chat_id, "⛔ لینک نامعتبر.")
             return
         session["crawler_pending_url"] = text
-        session["state"] = "awaiting_crawler_confirmation"      # <-- اصلاح: قفل کردن state
+        session["state"] = "awaiting_crawler_confirmation"      # قفل کردن state
         storage.set_session(chat_id, session)
         summary = f"🌐 شروع خزنده روی:\n{text}\nتنظیمات: {session['settings']['crawler_mode']}"
         kb = {"inline_keyboard": [[
@@ -376,7 +411,6 @@ def handle_message(chat_id: int, text: str):
         return
 
     elif state == "waiting_interactive_text":
-        # کاربر بعد از زدن /t... متن را وارد کرده است
         job_id = session.pop("pending_interactive_job_id", None)
         if not job_id:
             worker.send_message(chat_id, "⛔ درخواست کاوشگر منقضی شده است.")
@@ -424,10 +458,20 @@ def handle_message(chat_id: int, text: str):
             worker.send_message(chat_id, "📝 متن مورد نظر برای این فیلد را وارد کنید:")
             return
 
-        # ۲. دستورات /d, /o, /H, /a
+        # ۲. دستورات /api_ (جدید)
+        if text.startswith("/api_") and text in cmd_map:
+            url = cmd_map[text]
+            job = {"job_id": uuid.uuid4().hex, "chat_id": chat_id, "url": url, "mode": "download", "status": "queued", "created_at": time.time()}
+            storage.enqueue_job(QUEUE_FILE, job)
+            worker.send_message(chat_id, "🔗 دانلود API در صف قرار گرفت.")
+            session["state"] = "idle"
+            storage.set_session(chat_id, session)
+            return
+
+        # ۳. سایر دستورات (/d, /o, /H, /a)
         if text in cmd_map:
             url = cmd_map[text]
-            if text.startswith("/d") or text.startswith("/o"):
+            if text.startswith("/d") or text.startswith("/o") or text.startswith("/api_"):
                 mode = "download"
             else:
                 mode = "browser"
@@ -525,6 +569,11 @@ def handle_callback(cq: dict):
         session["state"] = "waiting_url_record"
         storage.set_session(chat_id, session)
         worker.send_message(chat_id, "🎬 لینک صفحهٔ دارای ویدیو را بفرستید:")
+        return
+    elif data == "menu_torrent":          # ★ جدید
+        session["state"] = "waiting_url_torrent"
+        storage.set_session(chat_id, session)
+        worker.send_message(chat_id, "🧲 لینک تورنت یا magnet را بفرستید:")
         return
     elif data == "menu_settings":
         kb = settings_keyboard(session)
@@ -674,6 +723,10 @@ def handle_callback(cq: dict):
             if not url:
                 worker.answer_callback_query(cq_id, "لینکی یافت نشد", show_alert=True)
                 return
+            # پیام وضعیت خزنده
+            status_msg = worker.send_message(chat_id, f"🕸️ درحال خزنده روی {url} ...")
+            if status_msg and status_msg.get("ok") and "result" in status_msg:
+                session["status_message_id"] = status_msg["result"]["message_id"]
             job = {
                 "job_id": uuid.uuid4().hex,
                 "chat_id": chat_id,
@@ -703,7 +756,6 @@ def handle_callback(cq: dict):
 
     # ---------- عملیات مرورگر ----------
     elif data.startswith("nav_") or data.startswith("dlvid_"):
-        # مستقیماً از _callback_urls ذخیره‌شده استفاده کن
         url = session.get("_callback_urls", {}).get(data)
         if url:
             mode = "browser" if data.startswith("nav_") else "download"
@@ -844,6 +896,21 @@ def handle_callback(cq: dict):
         storage.enqueue_job(QUEUE_FILE, job)
         return
 
+    # ★ جدید: API Hunter
+    elif data.startswith("apihunter_"):
+        url = session.get("browser_url")
+        if not url:
+            worker.answer_callback_query(cq_id, "صفحه‌ای باز نیست", show_alert=True)
+            return
+        worker.answer_callback_query(cq_id, "🔌 شنود API آغاز شد")
+        status_msg = worker.send_message(chat_id, "🔌 درحال شنود APIها...")
+        if status_msg and status_msg.get("ok") and "result" in status_msg:
+            session["status_message_id"] = status_msg["result"]["message_id"]
+            storage.set_session(chat_id, session)
+        job = {"job_id": uuid.uuid4().hex, "chat_id": chat_id, "url": url, "mode": "api_hunter", "status": "queued", "created_at": time.time()}
+        storage.enqueue_job(QUEUE_FILE, job)
+        return
+
     # دانلود (zip/raw)
     elif data.startswith("dlzip_") or data.startswith("dlraw_") or data.startswith("dlblindzip_") or data.startswith("dlblindra_"):
         job_id = data.split("_", 1)[1]
@@ -874,7 +941,7 @@ def handle_callback(cq: dict):
             worker.answer_callback_query(cq_id, "لغو شد")
         return
 
-    # اسکرین‌شات 2x/4k – تبدیل به answer_callback_query
+    # اسکرین‌شات 2x/4k
     elif data.startswith("req2x_"):
         job_id = data[len("req2x_"):]
         original = storage.find_job(QUEUE_FILE, job_id)
@@ -906,7 +973,7 @@ def handle_callback(cq: dict):
             storage.enqueue_job(QUEUE_FILE, new_job)
         return
 
-    # -------- ادمین (ساده شده) ----------
+    # -------- ادمین ----------
     elif data == "admin_server_info":
         info = get_server_info()
         worker.send_message(chat_id, info)
@@ -922,7 +989,7 @@ def handle_callback(cq: dict):
             worker.answer_callback_query(cq_id, "🔴 سرویس غیرفعال شد")
         return
 
-    # دکمه‌های صفحه‌بندی دانلودهای پیدا شده (مثلاً dfpg_)
+    # دکمه‌های صفحه‌بندی دانلودهای پیدا شده
     elif data.startswith("dfpg_"):
         parts = data.split("_")
         page = int(parts[2])
