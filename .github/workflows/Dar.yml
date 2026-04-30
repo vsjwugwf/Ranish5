@@ -1,0 +1,43 @@
+name: Ranish Bot - Runner
+
+on:
+  schedule:
+    # هر روز در ساعت‌های 00:00, 06:00, 12:00, 18:00 UTC اجرا می‌شه
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # اجازه اجرای دستی
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # 5h 55m (کمتر از محدودیت ۶ ساعته)
+
+    # جلوگیری از هم‌پوشانی اجراها (اگر اجرای قبلی هنوز تمام نشده بود، اجرای جدید صبر می‌کنه)
+    concurrency:
+      group: ranish-bot-runner
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg pulseaudio wget
+
+      - name: Install Python packages
+        run: |
+          pip install --upgrade pip
+          pip install requests beautifulsoup4 playwright aiohttp
+          playwright install --with-deps chromium
+
+      - name: Set environment variables
+        run: echo "BALE_BOT_TOKEN=${{ secrets.BALE_BOT_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Run Ranish Bot
+        run: python main.py
