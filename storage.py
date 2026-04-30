@@ -2,6 +2,7 @@ import os
 import time
 import json
 import copy
+import threading
 from typing import Optional, Dict, List
 
 from settings import (
@@ -20,6 +21,9 @@ from settings import (
 subscriptions_cache: Dict = {}
 sessions_cache: Dict = {}
 
+# قفل سراسری برای همگام‌سازی دسترسی به فایل‌ها
+_storage_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # ۱. ابزارهای عمومی خواندن / نوشتن JSON
@@ -31,19 +35,22 @@ def load_json(file_path: str, default: dict = None) -> dict:
     """
     if default is None:
         default = {}
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default
+    with _storage_lock:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return default
 
 
 def save_json(file_path: str, data: dict) -> None:
     """ابتدا در یک فایل موقت می‌نویسد، سپس با os.replace جایگزین می‌کند."""
-    tmp_path = file_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, file_path)
+    with _storage_lock:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        tmp_path = file_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, file_path)
 
 
 # ---------------------------------------------------------------------------
