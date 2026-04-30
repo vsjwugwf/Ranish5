@@ -17,23 +17,18 @@ from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, 
 # ---------------------------------------------------------------------------
 # Import پروژه
 # ---------------------------------------------------------------------------
-from settings import *          # تمام ثابت‌ها و تنظیمات
-from utils import *             # توابع کمکی
+from settings import *
+from utils import *
 import storage
 import worker
 
 # ---------------------------------------------------------------------------
-# متغیرهای سراسری Playwright
-# ---------------------------------------------------------------------------
-_global_playwright = None       # نمونهٔ Playwright
-_global_browser: Optional[Browser] = None
-_browser_contexts: Dict[str, Dict] = {}   # کلید -> {"context": ..., "last_used": ...}
-_browser_contexts_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# کمک‌کننده‌ها
+# دیگر خبری از متغیرهای سراسری Playwright نیست!
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# مسدود کردن تبلیغات (همچنان مورد نیاز)
+# ---------------------------------------------------------------------------
 def _adblock_router(route: Route) -> None:
     """مسدود کردن درخواست‌های تبلیغاتی بر اساس دامنه و کلمات کلیدی."""
     url = route.request.url
@@ -43,13 +38,11 @@ def _adblock_router(route: Route) -> None:
         route.continue_()
         return
 
-    # بررسی دامنه‌های تبلیغاتی
     for ad_domain in AD_DOMAINS:
         if ad_domain in domain:
             route.abort()
             return
 
-    # بررسی کلمات کلیدی در URL
     url_lower = url.lower()
     for kw in BLOCKED_AD_KEYWORDS:
         if kw in url_lower:
@@ -59,73 +52,31 @@ def _adblock_router(route: Route) -> None:
     route.continue_()
 
 
-def get_or_create_context(chat_id: int, incognito: bool = False) -> BrowserContext:
+# ---------------------------------------------------------------------------
+# جایگزین get_or_create_context – یک نمونهٔ کامل و مستقل
+# ---------------------------------------------------------------------------
+def create_browser_context(url: str, incognito: bool = False):
     """
-    دریافت یا ایجاد یک BrowserContext برای کاربر.
-    context ها بعد از ۲۰ دقیقه عدم استفاده بسته می‌شوند.
+    یک نمونهٔ کاملاً جدید از Playwright می‌سازد و یک page آماده برمی‌گرداند.
+    *url* برای تنظیم route استفاده می‌شود (همهٔ درخواست‌ها از مسیریاب عبور می‌کنند).
     """
-    global _global_playwright, _global_browser
-
-    key = f"{chat_id}_{'incognito' if incognito else 'default'}"
-    now = time.time()
-
-    with _browser_contexts_lock:
-        if key in _browser_contexts:
-            ctx_data = _browser_contexts[key]
-            if now - ctx_data["last_used"] < 1200:  # کمتر از ۲۰ دقیقه
-                ctx_data["last_used"] = now
-                return ctx_data["context"]
-            # منقضی شده – ببند
-            try:
-                ctx_data["context"].close()
-            except Exception:
-                pass
-            del _browser_contexts[key]
-
-        # راه‌اندازی مرورگر در صورت نیاز
-        if _global_browser is None:
-            _global_playwright = sync_playwright().start()
-            _global_browser = _global_playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--autoplay-policy=no-user-gesture-required",
-                ],
-            )
-
-        # ایجاد context جدید
-        width = 390  # می‌توان رندم هم کرد (390-414)
-        height = 844
-        context = _global_browser.new_context(viewport={"width": width, "height": height})
-
-        if incognito:
-            context.clear_cookies()
-
-        # افزودن router تبلیغاتی
-        context.route("**/*", _adblock_router)
-
-        _browser_contexts[key] = {"context": context, "last_used": now}
-        return context
-
-
-def close_user_context(chat_id: int, incognito: bool = False) -> None:
-    """بستن context اختصاصی یک کاربر."""
-    key = f"{chat_id}_{'incognito' if incognito else 'default'}"
-    with _browser_contexts_lock:
-        if key in _browser_contexts:
-            ctx_data = _browser_contexts.pop(key)
-            try:
-                ctx_data["context"].close()
-            except Exception:
-                pass
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+              "--autoplay-policy=no-user-gesture-required"]
+    )
+    context = browser.new_context(viewport={"width": 390, "height": 844})
+    if incognito:
+        context.clear_cookies()
+    context.route("**/*", _adblock_router)
+    page = context.new_page()
+    return pw, browser, context, page
 
 
 # ---------------------------------------------------------------------------
 # استخراج لینک و ویدیو
 # ---------------------------------------------------------------------------
-
 def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], List[str]]:
     """
     بر اساس *mode* لینک‌ها و ویدیوهای صفحه را استخراج می‌کند.
@@ -190,6 +141,35 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
         """
         links = page.evaluate(js_links)
         videos = page.evaluate(js_videos)
+
+        # فرصت بارگذاری بیشتر ویدیوها
+        page.wait_for_timeout(3000)
+
+        # جمع‌آوری ویدیوها از پاسخ‌های شبکه
+        network_videos = []
+        def _capture_response(response):
+            ct = response.headers.get("content-type", "")
+            if any(kw in ct for kw in ("video", "mpegurl", "dash+xml")):
+                network_videos.append(response.url)
+
+        page.on("response", _capture_response)
+        # یک اسکرول کوچک برای تحریک بارگذاری lazy
+        page.evaluate("window.scrollBy(0, 200)")
+        page.wait_for_timeout(1000)
+
+        seen = set(videos)
+        for v in network_videos:
+            if v not in seen:
+                seen.add(v)
+                videos.append(v)
+
+        # اسکن هوشمند اضافی
+        smart = scan_videos_smart(page)
+        for item in smart:
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                videos.append(item["url"])
+
         return [(t, txt, u) for t, txt, u in links], videos
 
     elif mode == "explorer":
@@ -228,9 +208,8 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
 
 
 # ---------------------------------------------------------------------------
-# نمایش صفحه‌بندی مرورگر
+# نمایش صفحه‌بندی مرورگر (دست نخورده)
 # ---------------------------------------------------------------------------
-
 def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_num: int) -> None:
     """
     صفحهٔ جاری از لینک‌های مرورگر را با کیبورد اینلاین می‌فرستد.
@@ -242,11 +221,9 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
     end = min(start + per_page, len(all_links))
     page_links = all_links[start:end]
 
-    # ذخیره موقت callback -> url
     callback_urls: Dict[str, str] = {}
     keyboard_rows = []
 
-    # ردیف‌های لینک‌ها
     row = []
     for idx, link in enumerate(page_links):
         global_idx = start + idx
@@ -264,10 +241,8 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
             keyboard_rows.append(row)
             row = []
     if row:
-        # اگر تعداد فرد بود، دکمهٔ آخر تنها می‌ماند
         keyboard_rows.append(row)
 
-    # ردیف نویگیشن
     nav_row = []
     if page_num > 0:
         nav_row.append({"text": "◀️", "callback_data": f"bpg_{chat_id}_{page_num - 1}"})
@@ -276,7 +251,6 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
     if nav_row:
         keyboard_rows.append(nav_row)
 
-    # ردیف‌های عملیات ویژه بر اساس حالت و اشتراک
     sub = session.get("subscription", "free")
     bw_mode = session["settings"].get("browser_mode", "text")
     extra_rows: List[List[dict]] = []
@@ -284,7 +258,6 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
     if bw_mode == "media":
         if sub in ("pro", "plus") or chat_id == ADMIN_CHAT_ID:
             extra_rows.append([{"text": "🎬 اسکن ویدیوها", "callback_data": f"scvid_{chat_id}"}])
-        # دکمهٔ خاموش/روشن adblock برای دامنهٔ فعلی
         domain = urlparse(session.get("browser_url", "")).hostname or ""
         ad_blocked = session.get("ad_blocked_domains", [])
         if domain in ad_blocked:
@@ -300,7 +273,6 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
     elif bw_mode == "text" and (sub in ("pro", "plus") or chat_id == ADMIN_CHAT_ID):
         extra_rows.append([{"text": "📦 جستجوی فایل‌ها", "callback_data": f"scdl_{chat_id}"}])
 
-    # دکمه‌های مشترک
     common_buttons = []
     if sub in ("pro", "plus") or chat_id == ADMIN_CHAT_ID:
         common_buttons.append({"text": "📋 فرامین", "callback_data": f"extcmd_{chat_id}"})
@@ -311,31 +283,25 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
         common_buttons.append({"text": "🌐 دانلود سایت", "callback_data": f"dlweb_{chat_id}"})
     common_buttons.append({"text": "🪟 حل کپچا", "callback_data": f"captcha_{chat_id}"})
     common_buttons.append({"text": "❌ بستن", "callback_data": f"closebrowser_{chat_id}"})
-    # دو تایی چینش
     for i in range(0, len(common_buttons), 2):
         row = common_buttons[i:i+2]
         extra_rows.append(row)
 
     keyboard_rows.extend(extra_rows)
 
-    # ذخیره callback_urls در session
     session["_callback_urls"] = callback_urls
     session["browser_page"] = page_num
     storage.set_session(chat_id, session)
 
-    # ارسال تصویر
     if image_path and os.path.isfile(image_path):
         worker.send_document(chat_id, image_path, caption=f"🌐 {url}")
 
-    # ارسال پیام با کیبورد
     total_pages = max(1, math.ceil(len(all_links) / per_page))
     text = f"صفحه {page_num + 1}/{total_pages}"
     markup = {"inline_keyboard": keyboard_rows}
     worker.send_message(chat_id, text, reply_markup=markup)
 
-    # ذخیره لینک‌های اضافی به صورت دستور /a...
     if len(all_links) > per_page:
-        # فقط لینک‌های خارج از این صفحه
         remaining = all_links[:start] + all_links[end:]
         cmd_map = {}
         for link in remaining:
@@ -348,7 +314,6 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
 # ---------------------------------------------------------------------------
 # محدودیت مصرف (ساده)
 # ---------------------------------------------------------------------------
-
 def check_rate_limit(chat_id: int, service: str, file_size_bytes: int = 0) -> Optional[str]:
     """
     بررسی محدودیت مصرف برای یک سرویس مشخص.
@@ -358,27 +323,23 @@ def check_rate_limit(chat_id: int, service: str, file_size_bytes: int = 0) -> Op
     sub = session.get("subscription", "free")
     limits = LIMITS.get(sub, {}).get(service)
     if not limits:
-        return None  # سرویس تعریف نشده، مشکلی نیست
+        return None
 
     max_count, window_seconds, max_size = limits
     now = time.time()
     usage = session.setdefault("usage", {}).setdefault(service, {"count": 0, "start_time": now, "total_size": 0})
 
-    # بازنشانی در صورت عبور از پنجره
     if now - usage["start_time"] > window_seconds:
         usage["count"] = 0
         usage["total_size"] = 0
         usage["start_time"] = now
 
-    # بررسی تعداد
     if usage["count"] >= max_count and max_count != 999:
         return f"⛔ محدودیت تعداد درخواست‌های `{service}` پر شده است."
 
-    # بررسی حجم
     if max_size is not None and usage["total_size"] + file_size_bytes > max_size:
         return f"⛔ محدودیت حجم دانلود برای `{service}` پر شده است."
 
-    # به‌روزرسانی
     usage["count"] += 1
     usage["total_size"] += file_size_bytes
     storage.set_session(chat_id, session)
@@ -388,13 +349,10 @@ def check_rate_limit(chat_id: int, service: str, file_size_bytes: int = 0) -> Op
 # ---------------------------------------------------------------------------
 # توابع کمکی صدا و تصویر برای ضبط
 # ---------------------------------------------------------------------------
-
 def setup_pulseaudio() -> bool:
     """راه‌اندازی PulseAudio مجازی برای ضبط صدا."""
     try:
-        # اطمینان از اجرای pulseaudio
         subprocess.run(["pulseaudio", "--start"], check=False, capture_output=True)
-        # بارگذاری ماژول null sink
         result = subprocess.run(
             ["pactl", "load-module", "module-null-sink", "sink_name=virtual_out"],
             capture_output=True, text=True
@@ -509,12 +467,7 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
             seen_urls.add(item["url"])
             results.append({"url": item["url"], "score": item.get("area", 1), "source": "element"})
 
-    # 2. پاسخ‌های شبکه (پویا – نمی‌توان به راحتی بعداً جمع کرد، اما در یک callback ذخیره می‌کنیم)
-    #    برای سادگی از page.on("response") استفاده می‌کنیم که نیاز به ذخیره‌سازی جانبی دارد.
-    #    در این پیاده‌سازی خلاصه شده است.
-    # (در صورت نیاز می‌توان از page.route برای جمع‌آوری استفاده کرد.)
-
-    # 3. اسکریپت‌های درون صفحه
+    # 2. اسکریپت‌های درون صفحه
     js_scripts = """
     () => {
         const urls = [];
@@ -535,7 +488,6 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
             seen_urls.add(u)
             results.append({"url": u, "score": 2, "source": "script"})
 
-    # مرتب‌سازی بر اساس امتیاز (بیشتر بهتر)
     results.sort(key=lambda x: x["score"], reverse=True)
     return results
 
@@ -561,13 +513,12 @@ def process_browser_job(job: dict) -> None:
         return
 
     session = storage.get_session(chat_id)
-    context = get_or_create_context(chat_id, incognito=session["settings"]["incognito_mode"])
-    page = None
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
 
+    pw, browser, context, page = None, None, None, None
     try:
-        page = context.new_page()
+        pw, browser, context, page = create_browser_context(url, incognito=session["settings"]["incognito_mode"])
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
 
@@ -596,6 +547,12 @@ def process_browser_job(job: dict) -> None:
     finally:
         if page:
             page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
@@ -605,13 +562,12 @@ def process_screenshot_job(job: dict) -> None:
     mode = job["mode"]
 
     session = storage.get_session(chat_id)
-    context = get_or_create_context(chat_id, incognito=session["settings"]["incognito_mode"])
-    page = None
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
 
+    pw, browser, context, page = None, None, None, None
     try:
-        page = context.new_page()
+        pw, browser, context, page = create_browser_context(url, incognito=False)
 
         if mode == "2x_screenshot":
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -629,7 +585,6 @@ def process_screenshot_job(job: dict) -> None:
 
         worker.send_document(chat_id, spath, caption=f"📸 {url}")
 
-        # دکمه‌های اضافی برای کاربران plus/pro
         sub = session.get("subscription", "free")
         if sub in ("plus", "pro") or chat_id == ADMIN_CHAT_ID:
             markup = {"inline_keyboard": [[
@@ -646,6 +601,12 @@ def process_screenshot_job(job: dict) -> None:
     finally:
         if page:
             page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
@@ -667,14 +628,12 @@ def process_download_job(job: dict) -> None:
         process_blind_download(job)
         return
 
-    # دریافت اطلاعات فایل
     try:
         head = requests.head(direct_link, timeout=10, allow_redirects=True)
         size_bytes = int(head.headers.get("Content-Length", 0))
     except Exception:
         size_bytes = 0
 
-    # بررسی محدودیت
     err = check_rate_limit(chat_id, "download", size_bytes)
     if err:
         worker.send_message(chat_id, err)
@@ -683,6 +642,11 @@ def process_download_job(job: dict) -> None:
 
     fname = get_filename_from_url(direct_link)
     size_str = f"{size_bytes / 1024 / 1024:.1f} MB" if size_bytes else "نامشخص"
+
+    # نمایش تعداد پارت‌ها
+    if size_bytes > 0:
+        part_count = math.ceil(size_bytes / ZIP_PART_SIZE)
+        size_str += f" | {part_count} پارت"
 
     keyboard = {"inline_keyboard": [[
         {"text": "📦 ZIP", "callback_data": f"dlzip_{job['job_id']}"},
@@ -711,7 +675,6 @@ def process_blind_download(job: dict) -> None:
         resp = requests.get(url, stream=True, timeout=30)
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
-        # حدس پسوند
         if "." not in fname:
             if "video/mp4" in content_type:
                 fname += ".mp4"
@@ -737,12 +700,17 @@ def process_blind_download(job: dict) -> None:
             _done_job(job)
             return
 
+        size_str = f"{size / 1024 / 1024:.1f} MB"
+        if size > 0:
+            part_count = math.ceil(size / ZIP_PART_SIZE)
+            size_str += f" | {part_count} پارت"
+
         keyboard = {"inline_keyboard": [[
             {"text": "📦 ZIP", "callback_data": f"dlblindzip_{job['job_id']}"},
             {"text": "📄 اصلی", "callback_data": f"dlblindra_{job['job_id']}"},
             {"text": "❌ لغو", "callback_data": f"canceljob_{job['job_id']}"},
         ]]}
-        worker.send_message(chat_id, f"📄 {fname} ({size / 1024 / 1024:.1f} MB)", reply_markup=keyboard)
+        worker.send_message(chat_id, f"📄 {fname} ({size_str})", reply_markup=keyboard)
 
         job["status"] = "awaiting_user"
         job["extra"] = {"file_path": fpath, "filename": fname}
@@ -768,7 +736,6 @@ def _send_file_parts(chat_id: int, file_path: str, use_zip: bool, label: str = "
     for part_path in parts:
         worker.send_document(chat_id, part_path, caption=label)
 
-    # ارسال فایل merge.txt برای راهنما
     merge_instructions = f"برای ادغام فایل‌ها:\ncat {' '.join(os.path.basename(p) for p in parts)} > merged"
     worker.send_message(chat_id, merge_instructions)
 
@@ -793,7 +760,6 @@ def process_download_execute(job: dict) -> None:
 
     try:
         if mode == "stream" and direct_link and not pack_zip:
-            # دانلود جریانی و ارسال همزمان قطعات
             resp = requests.get(direct_link, stream=True, timeout=30)
             resp.raise_for_status()
             part_size = ZIP_PART_SIZE
@@ -811,7 +777,6 @@ def process_download_execute(job: dict) -> None:
                     with open(part_path, "wb") as pf:
                         pf.write(part_data)
                     worker.send_document(chat_id, part_path, caption=f"🎬 {fname} (قطعه {part_idx})")
-            # باقی‌مانده
             if buffer:
                 part_idx += 1
                 part_name = f"{fname}.part{part_idx:03d}"
@@ -823,9 +788,7 @@ def process_download_execute(job: dict) -> None:
             _done_job(job)
             return
 
-        # دانلود کامل (برای store و adm)
         if direct_link:
-            # دانلود با range برای adm
             size_resp = requests.head(direct_link, timeout=10)
             total_size = int(size_resp.headers.get("Content-Length", 0))
             if mode == "adm" and total_size > 0:
@@ -841,7 +804,6 @@ def process_download_execute(job: dict) -> None:
                     if part_path:
                         downloaded_parts.append(part_path)
                 if downloaded_parts:
-                    # ترکیب قطعات
                     merged_path = os.path.join(job_dir, fname)
                     with open(merged_path, "wb") as mf:
                         for pp in downloaded_parts:
@@ -851,7 +813,6 @@ def process_download_execute(job: dict) -> None:
                 else:
                     raise Exception("downloading segments failed")
             else:
-                # دانلود معمولی
                 resp = requests.get(direct_link, timeout=30)
                 resp.raise_for_status()
                 final_file = os.path.join(job_dir, fname)
@@ -862,7 +823,6 @@ def process_download_execute(job: dict) -> None:
         else:
             raise Exception("no file")
 
-        # ارسال با توجه به pack_zip
         if not os.path.isfile(final_file):
             worker.send_message(chat_id, "❌ فایل نهایی یافت نشد.")
             _done_job(job)
@@ -907,7 +867,6 @@ def download_full_website(job: dict) -> None:
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        # تلاش با wget
         command = [
             "wget",
             "--adjust-extension",
@@ -928,7 +887,6 @@ def download_full_website(job: dict) -> None:
         if result.returncode != 0:
             raise Exception("wget failed")
 
-        # زیپ کردن پوشه
         zip_base = os.path.join(job_dir, "website")
         zip_path = f"{zip_base}.zip"
         shutil.make_archive(zip_base, 'zip', job_dir)
@@ -936,11 +894,10 @@ def download_full_website(job: dict) -> None:
         _done_job(job)
 
     except Exception:
-        # fallback: Playwright
         worker.send_message(chat_id, "wget در دسترس نیست، تلاش با مرورگر...")
+        pw = browser = context = page = None
         try:
-            context = get_or_create_context(chat_id, incognito=False)
-            page = context.new_page()
+            pw, browser, context, page = create_browser_context(url, incognito=False)
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             html = page.content()
@@ -958,7 +915,15 @@ def download_full_website(job: dict) -> None:
             job["status"] = "failed"
             storage.update_job(QUEUE_FILE, job)
         finally:
-            shutil.rmtree(job_dir, ignore_errors=True)
+            if page:
+                page.close()
+            if context:
+                context.close()
+            if browser:
+                browser.close()
+            if pw:
+                pw.stop()
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def process_record_job(job: dict) -> None:
@@ -997,11 +962,20 @@ def process_record_job(job: dict) -> None:
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                   "--autoplay-policy=no-user-gesture-required"]
         )
-        context = rec_browser.new_context(
-            viewport={"width": w, "height": h},
-            record_video_dir=job_dir,
-            record_video_size={"width": w, "height": h}
-        )
+        # تنظیم نرخ فریم برای 4K
+        if resolution == "4k":
+            context = rec_browser.new_context(
+                viewport={"width": w, "height": h},
+                record_video_dir=job_dir,
+                record_video_size={"width": w, "height": h},
+                record_video_fps=12
+            )
+        else:
+            context = rec_browser.new_context(
+                viewport={"width": w, "height": h},
+                record_video_dir=job_dir,
+                record_video_size={"width": w, "height": h}
+            )
         page = context.new_page()
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
@@ -1016,16 +990,13 @@ def process_record_job(job: dict) -> None:
         page.close()
         context.close()
 
-        # توقف ضبط صدا
         audio_ok = stop_audio_capture(audio_proc, audio_path) if audio_enabled else False
 
-        # پیدا کردن فایل ویدیو
         video_files = [f for f in os.listdir(job_dir) if f.endswith(".webm")]
         if not video_files:
             raise Exception("فایل ویدیو ضبط نشد")
         video_path = os.path.join(job_dir, video_files[0])
 
-        # تبدیل فرمت در صورت نیاز
         final_video_path = video_path
         if video_format != "webm":
             converted = os.path.join(job_dir, f"converted.{video_format}")
@@ -1037,14 +1008,12 @@ def process_record_job(job: dict) -> None:
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
             final_video_path = converted
 
-        # ارسال ویدیو
         video_zip = (video_delivery == "zip")
         if os.path.isfile(final_video_path):
             _send_file_parts(chat_id, final_video_path, use_zip=video_zip, label="🎬 ویدیو")
         else:
             worker.send_message(chat_id, "❌ فایل ویدیو نهایی یافت نشد.")
 
-        # ارسال صدا
         if audio_ok and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
             _send_file_parts(chat_id, audio_path, use_zip=video_zip, label="🎵 صوت")
 
@@ -1098,13 +1067,13 @@ def handle_scan_downloads(job: dict) -> None:
         return
 
     deep_mode = session["settings"].get("deep_scan_mode", "logical")
-    context = get_or_create_context(chat_id, incognito=False)
-    page = context.new_page()
+    pw = browser = context = page = None
     found = []
 
     try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        # استخراج لینک‌های مستقیم
+
         links_js = """
         () => {
             const urls = [];
@@ -1120,7 +1089,6 @@ def handle_scan_downloads(job: dict) -> None:
                 found.append({"url": u, "name": get_filename_from_url(u)})
 
         if not found and deep_mode == "everything":
-            # تلاش برای کراول
             for u in all_urls[:5]:
                 if not u.startswith("http"):
                     continue
@@ -1138,7 +1106,14 @@ def handle_scan_downloads(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا در جستجوی فایل‌ها: {e}")
         _done_job(job)
     finally:
-        page.close()
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
 
 def handle_scan_videos(job: dict) -> None:
@@ -1150,9 +1125,9 @@ def handle_scan_videos(job: dict) -> None:
         _done_job(job)
         return
 
-    context = get_or_create_context(chat_id, incognito=False)
-    page = context.new_page()
+    pw = browser = context = page = None
     try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         videos = scan_videos_smart(page)
         if not videos:
@@ -1175,7 +1150,14 @@ def handle_scan_videos(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا در اسکن ویدیو: {e}")
         _done_job(job)
     finally:
-        page.close()
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
 
 def handle_extract_commands(job: dict) -> None:
@@ -1236,36 +1218,68 @@ def handle_source_analyze(job: dict) -> None:
         _done_job(job)
         return
 
+    pw = browser = context = page = None
     try:
-        resp = requests.get(url, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # استفاده از Playwright برای بارگذاری کامل صفحه
+        pw, browser, context, page = create_browser_context(url, incognito=False)
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+
         urls = set()
         for tag in soup.find_all(["a", "img", "source", "script", "link"]):
             for attr in ["href", "src", "data-url"]:
                 val = tag.get(attr)
                 if val:
                     urls.add(urljoin(url, val))
-        # regex for scripts
+
         scripts = soup.find_all("script")
         for s in scripts:
             if s.string:
                 matches = re.findall(r'(https?://[^\s"\'<>]+)', s.string)
                 for m in matches:
                     urls.add(m)
+
+        # همچنین از خود Playwright برای جمع‌آوری لینک‌های داینامیک استفاده می‌کنیم
+        js_add = """
+        () => {
+            const extras = [];
+            document.querySelectorAll('a[href], img[src], source[src], video[src], iframe[src]').forEach(el => {
+                const val = el.href || el.src;
+                if (val) extras.push(val);
+            });
+            return extras;
+        }
+        """
+        extra_urls = page.evaluate(js_add)
+        for u in extra_urls:
+            urls.add(urljoin(url, u))
+
+        url_list = list(urls)[:30]
         cmds = []
-        url_list = list(urls)
-        for u in url_list[:30]:
+        for u in url_list:
             h = hashlib.md5(u.encode()).hexdigest()[:8]
             cmd = f"/H{h}"
             cmds.append(cmd)
             session.setdefault("text_links", {})[cmd] = u
         storage.set_session(chat_id, session)
-        lines = [f"{cmd}: {u[:40]}" for cmd, u in zip(cmds, url_list[:30])]
+
+        lines = [f"{cmd}: {u[:40]}" for cmd, u in zip(cmds, url_list)]
         worker.send_message(chat_id, "لینک‌های استخراج شده:\n" + "\n".join(lines))
         _done_job(job)
     except Exception as e:
         worker.send_message(chat_id, f"❌ خطا در تحلیل سورس: {e}")
         _done_job(job)
+    finally:
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
 
 def handle_download_all_found(job: dict) -> None:
@@ -1338,12 +1352,11 @@ def process_captcha_job(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
-    context = get_or_create_context(chat_id, incognito=False)
-    page = context.new_page()
+    pw = browser = context = page = None
     try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
-        # کلیک روی دکمه‌های احتمالی
         page.evaluate("""
             document.querySelectorAll('button, input[type="submit"], a[href*="download"]').forEach(el => el.click());
         """)
@@ -1370,7 +1383,14 @@ def process_captcha_job(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا در حل کپچا: {e}")
         _done_job(job)
     finally:
-        page.close()
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
@@ -1384,10 +1404,10 @@ def process_fullpage_screenshot(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
-    context = get_or_create_context(chat_id, incognito=False)
-    page = context.new_page()
+    pw = browser = context = page = None
     spath = os.path.join(job_dir, "screenshot.png")
     try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.screenshot(path=spath, full_page=True)
         worker.send_document(chat_id, spath)
@@ -1396,7 +1416,14 @@ def process_fullpage_screenshot(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا: {e}")
         _done_job(job)
     finally:
-        page.close()
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
@@ -1408,9 +1435,10 @@ def process_interactive_scan(job: dict) -> None:
         worker.send_message(chat_id, "⛔ ابتدا صفحه‌ای را باز کنید.")
         _done_job(job)
         return
-    context = get_or_create_context(chat_id, incognito=False)
-    page = context.new_page()
+
+    pw = browser = context = page = None
     try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         elements = page.evaluate("""
         () => {
@@ -1442,7 +1470,14 @@ def process_interactive_scan(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا: {e}")
         _done_job(job)
     finally:
-        page.close()
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
 
 def process_interactive_execute(job: dict) -> None:
@@ -1475,10 +1510,10 @@ def process_interactive_execute(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
-    context = get_or_create_context(chat_id, incognito=False)
-    page = context.new_page()
+    pw = browser = context = page = None
     spath = os.path.join(job_dir, "result.png")
     try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         selector = target["selector"]
         if not selector:
@@ -1500,7 +1535,14 @@ def process_interactive_execute(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا: {e}")
         _done_job(job)
     finally:
-        page.close()
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
