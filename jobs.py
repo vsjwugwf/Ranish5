@@ -208,7 +208,7 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
 
 
 # ---------------------------------------------------------------------------
-# نمایش صفحه‌بندی مرورگر (دست نخورده)
+# نمایش صفحه‌بندی مرورگر (با اضافه شدن دکمهٔ API Hunter)
 # ---------------------------------------------------------------------------
 def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_num: int) -> None:
     """
@@ -282,6 +282,8 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
     if sub == "pro" or chat_id == ADMIN_CHAT_ID:
         common_buttons.append({"text": "🌐 دانلود سایت", "callback_data": f"dlweb_{chat_id}"})
     common_buttons.append({"text": "🪟 حل کپچا", "callback_data": f"captcha_{chat_id}"})
+    # ★ دکمهٔ جدید API Hunter
+    common_buttons.append({"text": "🔌 API Hunter", "callback_data": f"apihunter_{chat_id}"})
     common_buttons.append({"text": "❌ بستن", "callback_data": f"closebrowser_{chat_id}"})
     for i in range(0, len(common_buttons), 2):
         row = common_buttons[i:i+2]
@@ -446,7 +448,7 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     seen_urls = set()
 
-    # 1. المان‌های <video> و <iframe>
+    # المان‌های <video> و <iframe>
     js_elements = """
     () => {
         const list = [];
@@ -467,7 +469,25 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
             seen_urls.add(item["url"])
             results.append({"url": item["url"], "score": item.get("area", 1), "source": "element"})
 
-    # 2. اسکریپت‌های درون صفحه
+    # ★ شنود پاسخ‌های شبکه (جدید)
+    network_urls = []
+    def capture(response):
+        ct = response.headers.get("content-type", "")
+        url_lower = response.url.lower()
+        if "mpegurl" in ct or "dash+xml" in ct or url_lower.endswith((".m3u8", ".mpd")) or \
+           ("video" in ct and (url_lower.endswith(".mp4") or url_lower.endswith(".webm") or url_lower.endswith(".mkv"))):
+            network_urls.append(response.url)
+
+    page.on("response", capture)
+    page.wait_for_timeout(3000)
+    page.off("response", capture)
+
+    for u in network_urls:
+        if u not in seen_urls:
+            seen_urls.add(u)
+            results.append({"url": u, "score": 100000, "source": "network"})
+
+    # اسکریپت‌های درون صفحه
     js_scripts = """
     () => {
         const urls = [];
@@ -643,7 +663,6 @@ def process_download_job(job: dict) -> None:
     fname = get_filename_from_url(direct_link)
     size_str = f"{size_bytes / 1024 / 1024:.1f} MB" if size_bytes else "نامشخص"
 
-    # نمایش تعداد پارت‌ها
     if size_bytes > 0:
         part_count = math.ceil(size_bytes / ZIP_PART_SIZE)
         size_str += f" | {part_count} پارت"
@@ -962,20 +981,12 @@ def process_record_job(job: dict) -> None:
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                   "--autoplay-policy=no-user-gesture-required"]
         )
-        # تنظیم نرخ فریم برای 4K
-        if resolution == "4k":
-            context = rec_browser.new_context(
-                viewport={"width": w, "height": h},
-                record_video_dir=job_dir,
-                record_video_size={"width": w, "height": h},
-                record_video_fps=12
-            )
-        else:
-            context = rec_browser.new_context(
-                viewport={"width": w, "height": h},
-                record_video_dir=job_dir,
-                record_video_size={"width": w, "height": h}
-            )
+        # حذف record_video_fps – با آرگومان نامعتبر
+        context = rec_browser.new_context(
+            viewport={"width": w, "height": h},
+            record_video_dir=job_dir,
+            record_video_size={"width": w, "height": h}
+        )
         page = context.new_page()
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
@@ -1007,6 +1018,15 @@ def process_record_job(job: dict) -> None:
             ]
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
             final_video_path = converted
+
+        # ★ کاهش نرخ فریم در 4K با ffmpeg
+        if resolution == "4k":
+            fps_fix = os.path.join(job_dir, "fixed_fps.webm")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", final_video_path, "-r", "12", fps_fix],
+                check=True, capture_output=True
+            )
+            final_video_path = fps_fix
 
         video_zip = (video_delivery == "zip")
         if os.path.isfile(final_video_path):
@@ -1057,6 +1077,7 @@ def _send_found_links_page(chat_id: int, links: List[Dict], page_num: int = 0) -
     worker.send_message(chat_id, msg)
 
 
+# ★ ارتقا یافته: جستجوی چندمرحله‌ای
 def handle_scan_downloads(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
@@ -1067,44 +1088,54 @@ def handle_scan_downloads(job: dict) -> None:
         return
 
     deep_mode = session["settings"].get("deep_scan_mode", "logical")
-    pw = browser = context = page = None
-    found = []
+    send_message = worker.send_message  # کوتاه‌سازی
 
+    found_links: Set[str] = set()
+    all_results: List[Dict[str, str]] = []
+
+    def add_result(link: str):
+        if link in found_links:
+            return
+        found_links.add(link)
+        fname = get_filename_from_url(link)
+        size_str = "نامشخص"
+        size_bytes = None
+        try:
+            head = requests.head(link, timeout=5, allow_redirects=True)
+            if head.headers.get("Content-Length"):
+                size_bytes = int(head.headers.get("Content-Length"))
+                size_str = f"{size_bytes / 1024 / 1024:.2f} MB"
+        except:
+            pass
+        if deep_mode == "logical" and not is_logical_download(link, size_bytes):
+            return
+        all_results.append({"name": fname[:35], "url": link, "size": size_str})
+
+    start_time = time.time()
+
+    # مرحله ۱: Playwright
+    pw = browser = context = page = None
     try:
         pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
-
-        links_js = """
-        () => {
-            const urls = [];
-            document.querySelectorAll('a[href]').forEach(a => {
-                urls.push(a.href);
-            });
-            return urls;
-        }
-        """
-        all_urls = page.evaluate(links_js)
-        for u in all_urls:
-            if is_direct_file_url(u) and not any(ad_domain in u for ad_domain in AD_DOMAINS):
-                found.append({"url": u, "name": get_filename_from_url(u)})
-
-        if not found and deep_mode == "everything":
-            for u in all_urls[:5]:
-                if not u.startswith("http"):
-                    continue
-                dl = crawl_for_download_link(u, max_depth=1, max_pages=5)
-                if dl and dl not in [f["url"] for f in found]:
-                    found.append({"url": dl, "name": get_filename_from_url(dl)})
-
-        if not found:
-            worker.send_message(chat_id, "🚫 هیچ فایلی یافت نشد.")
-        else:
-            _send_found_links_page(chat_id, found)
-
-        _done_job(job)
+        page.wait_for_timeout(1000)
+        all_hrefs = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href).filter(h => h.startsWith('http'));
+        }""")
+        for href in all_hrefs:
+            parsed = urlparse(href)
+            if any(ad in parsed.netloc for ad in AD_DOMAINS):
+                continue
+            if any(kw in href.lower() for kw in BLOCKED_AD_KEYWORDS):
+                continue
+            if is_direct_file_url(href):
+                add_result(href)
+        elapsed = time.time() - start_time
+        if all_results:
+            send_message(chat_id, f"✅ مرحله ۱: {len(all_results)} فایل ({elapsed:.1f}s)")
     except Exception as e:
-        worker.send_message(chat_id, f"❌ خطا در جستجوی فایل‌ها: {e}")
-        _done_job(job)
+        safe_log(f"scan_downloads stage1 error: {e}")
     finally:
         if page:
             page.close()
@@ -1114,6 +1145,51 @@ def handle_scan_downloads(job: dict) -> None:
             browser.close()
         if pw:
             pw.stop()
+
+    # مرحله ۲: کراول سبک
+    if not all_results and time.time() - start_time < 60:
+        send_message(chat_id, "🔄 مرحله ۲: کراول سبک...")
+        try:
+            s = requests.Session()
+            s.headers.update({"User-Agent": USER_AGENT})
+            resp = s.get(url, timeout=10)
+            if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+                soup = BeautifulSoup(resp.text, "html.parser")
+                links_to_crawl = []
+                for a in soup.find_all("a", href=True):
+                    href = urljoin(url, a["href"])
+                    parsed = urlparse(href)
+                    if any(ad in parsed.netloc for ad in AD_DOMAINS):
+                        continue
+                    if any(kw in href.lower() for kw in BLOCKED_AD_KEYWORDS):
+                        continue
+                    if is_direct_file_url(href):
+                        add_result(href)
+                    else:
+                        links_to_crawl.append(href)
+                for link in links_to_crawl[:15]:
+                    if time.time() - start_time > 60:
+                        break
+                    found = crawl_for_download_link(link, max_depth=1, max_pages=5, timeout_seconds=10)
+                    if found:
+                        add_result(found)
+                elapsed = time.time() - start_time
+                send_message(chat_id, f"✅ مرحله ۲: مجموعاً {len(all_results)} فایل ({elapsed:.1f}s)")
+        except Exception as e:
+            safe_log(f"scan_downloads stage2 error: {e}")
+
+    if not all_results:
+        send_message(chat_id, "🚫 هیچ فایل قابل دانلودی یافت نشد.")
+        _done_job(job)
+        return
+
+    # تبدیل به فرمت found_downloads پیشین
+    found_downloads = [{"url": r["url"], "name": r["name"], "size": r["size"]} for r in all_results]
+    session["found_downloads"] = found_downloads
+    session["found_downloads_page"] = 0
+    storage.set_session(chat_id, session)
+    _send_found_links_page(chat_id, found_downloads)
+    _done_job(job)
 
 
 def handle_scan_videos(job: dict) -> None:
@@ -1160,55 +1236,84 @@ def handle_scan_videos(job: dict) -> None:
             pw.stop()
 
 
+# ★ ارتقا یافته: نمایش همهٔ لینک‌ها با توضیح کامل
 def handle_extract_commands(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
     all_links = session.get("browser_links") or []
-    cmds = []
-    for link in all_links:
-        h = hashlib.md5(link["href"].encode()).hexdigest()[:8]
-        cmd = f"/H{h}"
-        cmds.append(cmd)
-        session.setdefault("text_links", {})[cmd] = link["href"]
-    storage.set_session(chat_id, session)
+    if not all_links:
+        worker.send_message(chat_id, "🚫 لینکی برای استخراج وجود ندارد.")
+        _done_job(job)
+        return
 
-    lines = []
-    for link, cmd in zip(all_links, cmds):
-        text = (link.get("text") or link["href"])[:40]
-        lines.append(f"{cmd}: {text}")
-    worker.send_message(chat_id, "دستورات مستقیم:\n" + "\n".join(lines))
+    cmds = {}
+    lines = [f"📋 **{len(all_links)} فرمان استخراج شد:**"]
+    for i, link in enumerate(all_links):
+        cmd = f"/H{hashlib.md5(link['href'].encode()).hexdigest()[:8]}"
+        cmds[cmd] = link['href']
+        line = f"{cmd} : {link['text'][:40]}\n🔗 {link['href'][:80]}"
+        lines.append(line)
+        if (i + 1) % 15 == 0 or i == len(all_links) - 1:
+            worker.send_message(chat_id, "\n".join(lines))
+            lines = [f"📋 **ادامه فرامین ({i+1}/{len(all_links)}):**"]
+
+    session.setdefault("text_links", {}).update(cmds)
+    storage.set_session(chat_id, session)
     _done_job(job)
 
 
+# ★ ارتقا یافته: دسته‌بندی هوشمند کامل
 def handle_smart_analyze(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
-    links = session.get("browser_links") or []
-    categories = {"video": "🎥 ویدیوها", "file": "📁 فایل‌ها", "page": "🌐 صفحات"}
-    grouped: Dict[str, List[Dict]] = {"video": [], "file": [], "page": []}
-    for link in links:
-        cat = categorize_url(link["href"])
-        grouped.setdefault(cat, []).append(link)
+    all_links = session.get("browser_links") or []
+    if not all_links:
+        worker.send_message(chat_id, "🚫 لینکی برای تحلیل وجود ندارد.")
+        _done_job(job)
+        return
 
-    for cat, cat_name in categories.items():
-        items = grouped.get(cat, [])[:10]
+    videos = []
+    files = []
+    pages = []
+    for link in all_links:
+        cat = categorize_url(link["href"])
+        if cat == "video":
+            videos.append(link)
+        elif cat in ("archive", "pdf", "image"):
+            files.append(link)
+        else:
+            pages.append(link)
+
+    cmds = {}
+
+    def send_category(title, items, prefix):
         if not items:
-            continue
-        cmds = []
+            return
+        lines = [f"**{title} ({len(items)}):**"]
         for item in items:
-            h = hashlib.md5(item["href"].encode()).hexdigest()[:8]
-            cmd = f"/H{h}"
-            cmds.append(cmd)
-            session.setdefault("text_links", {})[cmd] = item["href"]
-        storage.set_session(chat_id, session)
-        lines = []
-        for item, cmd in zip(items, cmds):
-            text = (item.get("text") or item["href"])[:30]
-            lines.append(f"{cmd}: {text}")
-        worker.send_message(chat_id, f"{cat_name}:\n" + "\n".join(lines))
+            cmd = f"/{prefix}{hashlib.md5(item['href'].encode()).hexdigest()[:8]}"
+            cmds[cmd] = item['href']
+            lines.append(f"{cmd} : {item['text'][:40]}\n🔗 {item['href'][:80]}")
+        worker.send_message(chat_id, "\n".join(lines))
+
+    send_category("🎬 ویدیوها", videos, "H")
+    send_category("📦 فایل‌ها", files, "H")
+    send_category("📄 صفحات", pages[:20], "H")
+
+    if pages[20:]:
+        lines = ["🔹 **بقیه صفحات:**"]
+        for item in pages[20:]:
+            cmd = f"/H{hashlib.md5(item['href'].encode()).hexdigest()[:8]}"
+            cmds[cmd] = item['href']
+            lines.append(f"{cmd} : {item['text'][:40]}")
+        worker.send_message(chat_id, "\n".join(lines))
+
+    session.setdefault("text_links", {}).update(cmds)
+    storage.set_session(chat_id, session)
     _done_job(job)
 
 
+# ★ ارتقا یافته: تحلیل سورس با Playwright
 def handle_source_analyze(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
@@ -1220,53 +1325,50 @@ def handle_source_analyze(job: dict) -> None:
 
     pw = browser = context = page = None
     try:
-        # استفاده از Playwright برای بارگذاری کامل صفحه
         pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(2000)
         html = page.content()
-        soup = BeautifulSoup(html, "html.parser")
 
-        urls = set()
-        for tag in soup.find_all(["a", "img", "source", "script", "link"]):
-            for attr in ["href", "src", "data-url"]:
+        soup = BeautifulSoup(html, "html.parser")
+        found_urls = set()
+
+        for tag in soup.find_all(["a", "link", "script", "img", "iframe", "source", "video", "audio"]):
+            for attr in ("href", "src", "data-url", "data-href", "data-link"):
                 val = tag.get(attr)
                 if val:
-                    urls.add(urljoin(url, val))
+                    try:
+                        found_urls.add(urljoin(url, val))
+                    except:
+                        pass
 
-        scripts = soup.find_all("script")
-        for s in scripts:
-            if s.string:
-                matches = re.findall(r'(https?://[^\s"\'<>]+)', s.string)
+        for script in soup.find_all("script"):
+            if script.string:
+                matches = re.findall(r'https?://[^\s"\'<>]+', script.string)
                 for m in matches:
-                    urls.add(m)
+                    found_urls.add(m)
 
-        # همچنین از خود Playwright برای جمع‌آوری لینک‌های داینامیک استفاده می‌کنیم
-        js_add = """
-        () => {
-            const extras = [];
-            document.querySelectorAll('a[href], img[src], source[src], video[src], iframe[src]').forEach(el => {
-                const val = el.href || el.src;
-                if (val) extras.push(val);
-            });
-            return extras;
-        }
-        """
-        extra_urls = page.evaluate(js_add)
-        for u in extra_urls:
-            urls.add(urljoin(url, u))
+        # حذف تبلیغات
+        clean_urls = [u for u in found_urls
+                      if not any(ad in u for ad in AD_DOMAINS) and
+                      not any(kw in u.lower() for kw in BLOCKED_AD_KEYWORDS)]
 
-        url_list = list(urls)[:30]
-        cmds = []
-        for u in url_list:
-            h = hashlib.md5(u.encode()).hexdigest()[:8]
-            cmd = f"/H{h}"
-            cmds.append(cmd)
-            session.setdefault("text_links", {})[cmd] = u
+        if not clean_urls:
+            worker.send_message(chat_id, "🚫 هیچ لینک مخفی یافت نشد.")
+            _done_job(job)
+            return
+
+        cmds = {}
+        lines = [f"🕵️ **{len(clean_urls)} لینک از سورس استخراج شد:**"]
+        for i, u in enumerate(clean_urls[:30]):
+            cmd = f"/H{hashlib.md5(u.encode()).hexdigest()[:8]}"
+            cmds[cmd] = u
+            label = urlparse(u).path.split("/")[-1][:30] or u[:40]
+            lines.append(f"{cmd} : {label}\n🔗 {u[:80]}")
+
+        worker.send_message(chat_id, "\n".join(lines))
+        session.setdefault("text_links", {}).update(cmds)
         storage.set_session(chat_id, session)
-
-        lines = [f"{cmd}: {u[:40]}" for cmd, u in zip(cmds, url_list)]
-        worker.send_message(chat_id, "لینک‌های استخراج شده:\n" + "\n".join(lines))
         _done_job(job)
     except Exception as e:
         worker.send_message(chat_id, f"❌ خطا در تحلیل سورس: {e}")
@@ -1520,7 +1622,12 @@ def process_interactive_execute(job: dict) -> None:
             worker.send_message(chat_id, "⛔ سلکتور نامعتبر.")
             _done_job(job)
             return
+
+        # رفع timeout: کلیک روی فیلد قبل از fill
+        page.click(selector)
+        page.wait_for_timeout(500)
         page.fill(selector, user_text)
+
         page.evaluate("""
             () => {
                 const el = document.querySelector('input[type="submit"], button[type="submit"], form button');
@@ -1547,7 +1654,115 @@ def process_interactive_execute(job: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# نگاشت mode به تابع
+# ★ قابلیت جدید: دانلود تورنت
+# ---------------------------------------------------------------------------
+def process_torrent_job(job: dict) -> None:
+    chat_id = job["chat_id"]
+    url = job["url"]  # می‌تواند magnet یا لینک فایل .torrent باشد
+    job_dir = f"jobs/{job['job_id']}"
+    os.makedirs(job_dir, exist_ok=True)
+
+    worker.send_message(chat_id, "🧲 درحال دانلود تورنت...")
+
+    try:
+        cmd = ["aria2c", "--dir", job_dir, "--seed-time=0", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0 and "No such file or directory" not in result.stderr:
+            raise Exception(result.stderr[-200:])
+
+        # جمع‌آوری فایل‌های دانلودشده (به جز .aria2)
+        all_files = []
+        for root, _, files in os.walk(job_dir):
+            for file in files:
+                if not file.endswith(".aria2"):
+                    all_files.append(os.path.join(root, file))
+        if not all_files:
+            raise Exception("هیچ فایلی تکمیل نشد.")
+
+        zip_path = os.path.join(job_dir, "torrent_result.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            for fp in all_files:
+                zf.write(fp, os.path.basename(fp))
+        _send_file_parts(chat_id, zip_path, use_zip=False, label="Torrent Result")
+        _done_job(job)
+    except Exception as e:
+        worker.send_message(chat_id, f"❌ خطا در تورنت: {e}")
+        job["status"] = "failed"
+        storage.update_job(QUEUE_FILE, job)
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# ★ قابلیت جدید: API Hunter
+# ---------------------------------------------------------------------------
+def process_api_hunter_job(job: dict) -> None:
+    chat_id = job["chat_id"]
+    session = storage.get_session(chat_id)
+    url = session.get("browser_url") or job.get("url")
+    if not url:
+        worker.send_message(chat_id, "⛔ URL نامعتبر.")
+        _done_job(job)
+        return
+
+    pw = browser = context = page = None
+    try:
+        pw, browser, context, page = create_browser_context(url, incognito=False)
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+
+        api_calls = []
+        def capture(response):
+            ct = response.headers.get("content-type", "")
+            if any(kw in ct for kw in ["json", "xml", "text/plain", "octet-stream"]) or "api" in response.url.lower():
+                api_calls.append({
+                    "url": response.url,
+                    "status": response.status,
+                    "method": response.request.method
+                })
+
+        page.on("response", capture)
+        page.wait_for_timeout(5000)
+        page.off("response", capture)
+
+        # یکتاسازی
+        seen = set()
+        unique = []
+        for item in api_calls:
+            if item["url"] not in seen:
+                seen.add(item["url"])
+                unique.append(item)
+
+        if not unique:
+            worker.send_message(chat_id, "🔍 هیچ API یافت نشد.")
+        else:
+            cmds = {}
+            lines = [f"🔌 **{len(unique)} فراخوانی API شکار شد:**"]
+            for i, item in enumerate(unique[:30]):
+                cmd = f"/api_{hashlib.md5(item['url'].encode()).hexdigest()[:8]}"
+                cmds[cmd] = item["url"]
+                lines.append(f"{cmd} [{item['status']} {item['method']}] {item['url'][:70]}")
+            worker.send_message(chat_id, "\n".join(lines))
+            session.setdefault("text_links", {}).update(cmds)
+            storage.set_session(chat_id, session)
+
+        _done_job(job)
+    except Exception as e:
+        worker.send_message(chat_id, f"❌ خطا در API Hunter: {e}")
+        _done_job(job)
+    finally:
+        if page:
+            page.close()
+        if context:
+            context.close()
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
+
+
+# ---------------------------------------------------------------------------
+# نگاشت mode به تابع (شامل قابلیت‌های جدید)
 # ---------------------------------------------------------------------------
 JOB_HANDLERS = {
     "browser": process_browser_job,
@@ -1570,4 +1785,6 @@ JOB_HANDLERS = {
     "interactive_scan": process_interactive_scan,
     "interactive_execute": process_interactive_execute,
     "record_video": process_record_job,
+    "torrent": process_torrent_job,          # ★ جدید
+    "api_hunter": process_api_hunter_job,    # ★ جدید
 }
