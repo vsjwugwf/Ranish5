@@ -198,7 +198,7 @@ def _crawler_job_handler(job: dict):
     crawl_settings = extra.get("settings", {})
     stop_ev = threading.Event()
 
-    async def progress_callback(msg: str, file_path: str = None):
+    def progress_callback(msg: str, file_path: str = None):
         if msg == "__FINAL_ZIP__" and file_path:
             file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
             if file_size <= ZIP_PART_SIZE:
