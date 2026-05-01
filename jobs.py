@@ -18,9 +18,63 @@ from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, 
 # Import پروژه
 # ---------------------------------------------------------------------------
 from settings import *
-from utils import *
+from utils import (
+    is_direct_file_url,
+    categorize_url,
+    get_filename_from_url,
+    is_valid_url,
+    crawl_for_download_link,
+    split_file_binary,
+    create_zip_and_split,
+    safe_log,
+    is_logical_download,
+)
 import storage
 import worker
+
+# ---------------------------------------------------------------------------
+# توابع کمکی پروکسی و فشرده‌سازی 7z (از utils یا موقتی)
+# ---------------------------------------------------------------------------
+try:
+    from utils import get_proxy_dict
+except ImportError:
+    def get_proxy_dict(proxy_mode: str) -> Optional[Dict]:
+        """نگاشت حالت پروکسی به دیکشنری requests/Playwright"""
+        proxy_mode = proxy_mode or "off"
+        if proxy_mode == "off":
+            return None
+        elif proxy_mode == "warp":
+            return {"server": "socks5://127.0.0.1:40000"}
+        elif proxy_mode == "tor":
+            return {"server": "socks5://127.0.0.1:9050"}
+        elif proxy_mode == "free":
+            # یک پروکسی رایگان نمونه (در عمل باید داینامیک باشد)
+            return {"server": "socks5://127.0.0.1:1080"}
+        return None
+
+try:
+    from utils import compress_7z
+except ImportError:
+    def compress_7z(file_path: str) -> str:
+        """
+        فشرده‌سازی با 7z.
+        خروجی: مسیر فایل 7z. در صورت نبود 7z، فایل زیپ معمولی ساخته می‌شود.
+        """
+        out_path = file_path + ".7z"
+        if shutil.which("7z"):
+            try:
+                subprocess.run(["7z", "a", "-mx=9", out_path, file_path],
+                               check=True, capture_output=True, timeout=300)
+                if os.path.exists(out_path):
+                    return out_path
+            except Exception:
+                pass
+        # fallback به zip معمولی
+        import zipfile as zf
+        zp = file_path + ".zip"
+        with zf.ZipFile(zp, "w", zf.ZIP_DEFLATED, compresslevel=9) as z:
+            z.write(file_path, os.path.basename(file_path))
+        return zp
 
 # ---------------------------------------------------------------------------
 # دیگر خبری از متغیرهای سراسری Playwright نیست!
@@ -53,9 +107,9 @@ def _adblock_router(route: Route) -> None:
 
 
 # ---------------------------------------------------------------------------
-# جایگزین get_or_create_context – یک نمونهٔ کامل و مستقل
+# جایگزین get_or_create_context – یک نمونهٔ کامل و مستقل (با پروکسی)
 # ---------------------------------------------------------------------------
-def create_browser_context(url: str, incognito: bool = False):
+def create_browser_context(url: str, incognito: bool = False, proxy: Optional[Dict] = None):
     """
     یک نمونهٔ کاملاً جدید از Playwright می‌سازد و یک page آماده برمی‌گرداند.
     *url* برای تنظیم route استفاده می‌شود (همهٔ درخواست‌ها از مسیریاب عبور می‌کنند).
@@ -66,7 +120,11 @@ def create_browser_context(url: str, incognito: bool = False):
         args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
               "--autoplay-policy=no-user-gesture-required"]
     )
-    context = browser.new_context(viewport={"width": 390, "height": 844})
+    # تنظیمات context
+    context_kwargs = {"viewport": {"width": 390, "height": 844}}
+    if proxy:
+        context_kwargs["proxy"] = proxy
+    context = browser.new_context(**context_kwargs)
     if incognito:
         context.clear_cookies()
     context.route("**/*", _adblock_router)
@@ -153,11 +211,9 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
                 network_videos.append(response.url)
 
         page.on("response", _capture_response)
-        # یک اسکرول کوچک برای تحریک بارگذاری lazy
         page.evaluate("window.scrollBy(0, 200)")
         page.wait_for_timeout(1000)
-
-        # حذف شنونده قبل از پردازش
+        # حذف شنونده
         page.remove_listener("response", _capture_response)
 
         seen = set(videos)
@@ -166,7 +222,6 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
                 seen.add(v)
                 videos.append(v)
 
-        # اسکن هوشمند اضافی
         smart = scan_videos_smart(page)
         for item in smart:
             if item["url"] not in seen:
@@ -211,7 +266,7 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
 
 
 # ---------------------------------------------------------------------------
-# نمایش صفحه‌بندی مرورگر (با اضافه شدن دکمهٔ API Hunter)
+# نمایش صفحه‌بندی مرورگر (با API Hunter)
 # ---------------------------------------------------------------------------
 def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_num: int) -> None:
     """
@@ -285,7 +340,6 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
     if sub == "pro" or chat_id == ADMIN_CHAT_ID:
         common_buttons.append({"text": "🌐 دانلود سایت", "callback_data": f"dlweb_{chat_id}"})
     common_buttons.append({"text": "🪟 حل کپچا", "callback_data": f"captcha_{chat_id}"})
-    # ★ دکمهٔ جدید API Hunter
     common_buttons.append({"text": "🔌 API Hunter", "callback_data": f"apihunter_{chat_id}"})
     common_buttons.append({"text": "❌ بستن", "callback_data": f"closebrowser_{chat_id}"})
     for i in range(0, len(common_buttons), 2):
@@ -320,10 +374,6 @@ def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_nu
 # محدودیت مصرف (ساده)
 # ---------------------------------------------------------------------------
 def check_rate_limit(chat_id: int, service: str, file_size_bytes: int = 0) -> Optional[str]:
-    """
-    بررسی محدودیت مصرف برای یک سرویس مشخص.
-    در صورت رد شدن، پیام خطا برمی‌گرداند. در غیر این صورت None.
-    """
     session = storage.get_session(chat_id)
     sub = session.get("subscription", "free")
     limits = LIMITS.get(sub, {}).get(service)
@@ -355,7 +405,6 @@ def check_rate_limit(chat_id: int, service: str, file_size_bytes: int = 0) -> Op
 # توابع کمکی صدا و تصویر برای ضبط
 # ---------------------------------------------------------------------------
 def setup_pulseaudio() -> bool:
-    """راه‌اندازی PulseAudio مجازی برای ضبط صدا."""
     try:
         subprocess.run(["pulseaudio", "--start"], check=False, capture_output=True)
         result = subprocess.run(
@@ -371,7 +420,6 @@ def setup_pulseaudio() -> bool:
 
 
 def start_audio_capture(job_dir: str) -> Tuple[Optional[subprocess.Popen], str]:
-    """شروع ضبط صدا با ffmpeg."""
     audio_path = os.path.join(job_dir, "audio.mp3")
     try:
         proc = subprocess.Popen([
@@ -385,7 +433,6 @@ def start_audio_capture(job_dir: str) -> Tuple[Optional[subprocess.Popen], str]:
 
 
 def stop_audio_capture(proc: Optional[subprocess.Popen], audio_path: str) -> bool:
-    """توقف ضبط و بررسی موفقیت."""
     if proc:
         try:
             proc.terminate()
@@ -399,7 +446,6 @@ def stop_audio_capture(proc: Optional[subprocess.Popen], audio_path: str) -> boo
 
 
 def smooth_scroll_to_video(page: Page) -> None:
-    """اسکرول نرم به بزرگ‌ترین ویدیو یا iframe."""
     js = """
     () => {
         let el = null, maxArea = 0;
@@ -420,7 +466,6 @@ def smooth_scroll_to_video(page: Page) -> None:
 
 
 def find_video_center(page: Page) -> Tuple[float, float]:
-    """مرکز بزرگ‌ترین ویدیو/iframe را برمی‌گرداند."""
     js = """
     () => {
         let el = null, maxArea = 0;
@@ -446,12 +491,10 @@ def find_video_center(page: Page) -> Tuple[float, float]:
 def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
     """
     جستجوی هوشمند ویدیوها در صفحه: المان‌ها، پاسخ‌های شبکه و اسکریپت‌ها.
-    خروج: لیست دیکشنری با کلیدهای url, score, source
     """
     results: List[Dict[str, Any]] = []
     seen_urls = set()
 
-    # المان‌های <video> و <iframe>
     js_elements = """
     () => {
         const list = [];
@@ -472,7 +515,6 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
             seen_urls.add(item["url"])
             results.append({"url": item["url"], "score": item.get("area", 1), "source": "element"})
 
-    # ★ شنود پاسخ‌های شبکه (جدید)
     network_urls = []
     def capture(response):
         ct = response.headers.get("content-type", "")
@@ -490,7 +532,6 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
             seen_urls.add(u)
             results.append({"url": u, "score": 100000, "source": "network"})
 
-    # اسکریپت‌های درون صفحه
     js_scripts = """
     () => {
         const urls = [];
@@ -520,7 +561,6 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _done_job(job: dict, mode_file: str = QUEUE_FILE) -> None:
-    """مارک job به عنوان done و ذخیره در صف."""
     job["status"] = "done"
     job["updated_at"] = time.time()
     storage.update_job(mode_file, job)
@@ -539,9 +579,14 @@ def process_browser_job(job: dict) -> None:
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
 
+    proxy_mode = session["settings"].get("proxy_mode", "off")
+    proxy = get_proxy_dict(proxy_mode)
+
     pw, browser, context, page = None, None, None, None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=session["settings"]["incognito_mode"])
+        pw, browser, context, page = create_browser_context(
+            url, incognito=session["settings"]["incognito_mode"], proxy=proxy
+        )
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
 
@@ -588,9 +633,12 @@ def process_screenshot_job(job: dict) -> None:
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
 
+    proxy_mode = session["settings"].get("proxy_mode", "off")
+    proxy = get_proxy_dict(proxy_mode)
+
     pw, browser, context, page = None, None, None, None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
 
         if mode == "2x_screenshot":
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -641,18 +689,19 @@ def process_download_job(job: dict) -> None:
     url = job["url"]
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
 
     if is_direct_file_url(url):
         direct_link = url
     else:
-        direct_link = crawl_for_download_link(url, max_depth=1, max_pages=10)
+    	direct_link = crawl_for_download_link(url, max_depth=1, max_pages=10)
 
     if not direct_link:
         process_blind_download(job)
         return
 
     try:
-        head = requests.head(direct_link, timeout=10, allow_redirects=True)
+        head = requests.head(direct_link, timeout=10, allow_redirects=True, proxies=proxy)
         size_bytes = int(head.headers.get("Content-Length", 0))
     except Exception:
         size_bytes = 0
@@ -665,7 +714,6 @@ def process_download_job(job: dict) -> None:
 
     fname = get_filename_from_url(direct_link)
     size_str = f"{size_bytes / 1024 / 1024:.1f} MB" if size_bytes else "نامشخص"
-
     if size_bytes > 0:
         part_count = math.ceil(size_bytes / ZIP_PART_SIZE)
         size_str += f" | {part_count} پارت"
@@ -688,13 +736,14 @@ def process_blind_download(job: dict) -> None:
     session = storage.get_session(chat_id)
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
 
     fname = get_filename_from_url(url)
     if fname == "downloaded_file":
         fname = f"download_{uuid.uuid4().hex[:8]}"
 
     try:
-        resp = requests.get(url, stream=True, timeout=30)
+        resp = requests.get(url, stream=True, timeout=30, proxies=proxy)
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if "." not in fname:
@@ -746,11 +795,17 @@ def process_blind_download(job: dict) -> None:
 def _send_file_parts(chat_id: int, file_path: str, use_zip: bool, label: str = "", compression: str = "normal") -> None:
     """
     ارسال فایل به صورت قطعه‌قطعه (با توجه به ZIP_PART_SIZE و نوع تحویل).
-    compression می‌تواند "normal" یا "high" باشد.
+    اگر use_zip و compression=="high" باشد، از 7z استفاده می‌شود.
     """
     if use_zip:
-        base = os.path.splitext(os.path.basename(file_path))[0]
-        parts = create_zip_and_split(file_path, base, compression=compression)
+        if compression == "high":
+            archive_path = compress_7z(file_path)
+            base = os.path.splitext(os.path.basename(archive_path))[0]
+            ext = ".7z"
+            parts = split_file_binary(archive_path, base, ext)
+        else:
+            base = os.path.splitext(os.path.basename(file_path))[0]
+            parts = create_zip_and_split(file_path, base, compression=compression)
     else:
         base, ext = os.path.splitext(os.path.basename(file_path))
         ext = ext if ext else ".bin"
@@ -767,12 +822,13 @@ def process_download_execute(job: dict) -> None:
     extra = job.get("extra", {})
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
-    mode = session["settings"]["default_download_mode"]  # store, stream, adm
+    mode = session["settings"]["default_download_mode"]
     pack_zip = extra.get("pack_zip", False)
     direct_link = extra.get("direct_link")
     fpath = extra.get("file_path")
     fname = extra.get("filename", "file")
     compression = session["settings"].get("compression_level", "normal")
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
@@ -784,7 +840,7 @@ def process_download_execute(job: dict) -> None:
 
     try:
         if mode == "stream" and direct_link and not pack_zip:
-            resp = requests.get(direct_link, stream=True, timeout=30)
+            resp = requests.get(direct_link, stream=True, timeout=30, proxies=proxy)
             resp.raise_for_status()
             part_size = ZIP_PART_SIZE
             part_idx = 0
@@ -813,35 +869,11 @@ def process_download_execute(job: dict) -> None:
             return
 
         if direct_link:
-            size_resp = requests.head(direct_link, timeout=10)
-            total_size = int(size_resp.headers.get("Content-Length", 0))
-            if mode == "adm" and total_size > 0:
-                segment_count = 9
-                segment_size = math.ceil(total_size / segment_count)
-                downloaded_parts = []
-                for i in range(segment_count):
-                    start = i * segment_size
-                    end = min(start + segment_size - 1, total_size - 1)
-                    if start >= total_size:
-                        break
-                    part_path = _download_segment(direct_link, job_dir, fname, start, end, {})
-                    if part_path:
-                        downloaded_parts.append(part_path)
-                if downloaded_parts:
-                    merged_path = os.path.join(job_dir, fname)
-                    with open(merged_path, "wb") as mf:
-                        for pp in downloaded_parts:
-                            with open(pp, "rb") as pf:
-                                mf.write(pf.read())
-                    final_file = merged_path
-                else:
-                    raise Exception("downloading segments failed")
-            else:
-                resp = requests.get(direct_link, timeout=30)
-                resp.raise_for_status()
-                final_file = os.path.join(job_dir, fname)
-                with open(final_file, "wb") as f:
-                    f.write(resp.content)
+            resp = requests.get(direct_link, timeout=30, proxies=proxy)
+            resp.raise_for_status()
+            final_file = os.path.join(job_dir, fname)
+            with open(final_file, "wb") as f:
+                f.write(resp.content)
         elif fpath:
             final_file = fpath
         else:
@@ -867,79 +899,57 @@ def process_download_execute(job: dict) -> None:
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-def _download_segment(url: str, job_dir: str, fname: str, start: int, end: int, headers: dict) -> Optional[str]:
-    """دانلود یک بخش از فایل با هدر Range."""
-    try:
-        hdrs = headers.copy()
-        hdrs["Range"] = f"bytes={start}-{end}"
-        resp = requests.get(url, headers=hdrs, timeout=30)
-        if resp.status_code not in (200, 206):
-            return None
-        part_name = f"{fname}.part{start}-{end}"
-        part_path = os.path.join(job_dir, part_name)
-        with open(part_path, "wb") as f:
-            f.write(resp.content)
-        return part_path
-    except Exception:
-        return None
-
-
 def download_full_website(job: dict) -> None:
+    """دانلود کامل وب‌سایت با wget یا fallback Playwright (برگرفته از Ranish.py)"""
     chat_id = job["chat_id"]
     url = job["url"]
     session = storage.get_session(chat_id)
     compression = session["settings"].get("compression_level", "normal")
+    proxy_mode = session["settings"].get("proxy_mode", "off")
+    proxy = get_proxy_dict(proxy_mode)
+
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
 
-    try:
-        command = [
-            "wget",
-            "--adjust-extension",
-            "--span-hosts",
-            "--convert-links",
-            "--page-requisites",
-            "--no-directories",
-            "--directory-prefix", job_dir,
-            "--recursive",
-            "--level=1",
-            "--accept", "html,css,js,jpg,jpeg,png,gif,svg,mp4,webm,pdf",
-            "--user-agent", USER_AGENT,
-            "--timeout=30",
-            "--tries=2",
-            url
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception("wget failed")
+    worker.send_message(chat_id, "🌐 دانلود کامل وب‌سایت...")
 
-        zip_base = os.path.join(job_dir, "website")
-        zip_path = f"{zip_base}.zip"
-        shutil.make_archive(zip_base, 'zip', job_dir)
-        _send_file_parts(chat_id, zip_path, use_zip=False, label="Website", compression=compression)
-        _done_job(job)
+    # تلاش با wget
+    wget_ok = False
+    if shutil.which("wget"):
+        try:
+            cmd = [
+                "wget", "--adjust-extension", "--span-hosts", "--convert-links",
+                "--page-requisites", "--no-directories", "--directory-prefix", job_dir,
+                "--recursive", "--level=1",
+                "--accept", "html,css,js,jpg,jpeg,png,gif,svg,mp4,webm,pdf",
+                "--user-agent", USER_AGENT,
+                "--timeout", "30", "--tries", "2",
+                url
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            wget_ok = (result.returncode == 0)
+        except Exception:
+            pass
 
-    except Exception:
+    if wget_ok:
+        # ادامه با زیپ و ارسال
+        pass  # از پایین ادامه می‌دهد
+    else:
         worker.send_message(chat_id, "wget در دسترس نیست، تلاش با مرورگر...")
         pw = browser = context = page = None
         try:
-            pw, browser, context, page = create_browser_context(url, incognito=False)
+            pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             html = page.content()
             with open(os.path.join(job_dir, "index.html"), "w", encoding="utf-8") as f:
                 f.write(html)
             page.screenshot(path=os.path.join(job_dir, "screenshot.png"), full_page=True)
-
-            zip_base = os.path.join(job_dir, "website")
-            zip_path = f"{zip_base}.zip"
-            shutil.make_archive(zip_base, 'zip', job_dir)
-            _send_file_parts(chat_id, zip_path, use_zip=False, label="Website (fallback)", compression=compression)
-            _done_job(job)
         except Exception as e:
-            worker.send_message(chat_id, f"❌ دانلود سایت ناموفق بود. ممکن است سایت در دسترس نباشد. ({e})")
-            job["status"] = "failed"
+            worker.send_message(chat_id, f"❌ خطا: {e}")
+            job["status"] = "error"
             storage.update_job(QUEUE_FILE, job)
+            return
         finally:
             if page:
                 page.close()
@@ -949,7 +959,26 @@ def download_full_website(job: dict) -> None:
                 browser.close()
             if pw:
                 pw.stop()
-        shutil.rmtree(job_dir, ignore_errors=True)
+
+    # زیپ کردن تمام فایل‌های job_dir
+    all_files = []
+    for root, _, files in os.walk(job_dir):
+        for f in files:
+            all_files.append(os.path.join(root, f))
+    if not all_files:
+        worker.send_message(chat_id, "❌ محتوایی یافت نشد.")
+        job["status"] = "error"
+        storage.update_job(QUEUE_FILE, job)
+        return
+
+    zip_path = os.path.join(job_dir, "website.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fp in all_files:
+            zf.write(fp, os.path.relpath(fp, job_dir))
+
+    _send_file_parts(chat_id, zip_path, use_zip=False, label="Website", compression=compression)
+    _done_job(job)
+    shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def process_record_job(job: dict) -> None:
@@ -1026,7 +1055,6 @@ def process_record_job(job: dict) -> None:
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
             final_video_path = converted
 
-        # ★ کاهش نرخ فریم در 4K با ffmpeg
         if resolution == "4k":
             fps_fix = os.path.join(job_dir, "fixed_fps.webm")
             subprocess.run(
@@ -1062,7 +1090,6 @@ def process_record_job(job: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _send_found_links_page(chat_id: int, links: List[Dict], page_num: int = 0) -> None:
-    """نمایش صفحه‌بندی شدهٔ لینک‌های پیدا شده."""
     per_page = 10
     session = storage.get_session(chat_id)
     session["found_downloads"] = links
@@ -1084,7 +1111,6 @@ def _send_found_links_page(chat_id: int, links: List[Dict], page_num: int = 0) -
     worker.send_message(chat_id, msg)
 
 
-# ★ ارتقا یافته: جستجوی چندمرحله‌ای
 def handle_scan_downloads(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
@@ -1095,6 +1121,7 @@ def handle_scan_downloads(job: dict) -> None:
         return
 
     deep_mode = session["settings"].get("deep_scan_mode", "logical")
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     send_message = worker.send_message
 
     found_links: Set[str] = set()
@@ -1108,7 +1135,7 @@ def handle_scan_downloads(job: dict) -> None:
         size_str = "نامشخص"
         size_bytes = None
         try:
-            head = requests.head(link, timeout=5, allow_redirects=True)
+            head = requests.head(link, timeout=5, allow_redirects=True, proxies=proxy)
             if head.headers.get("Content-Length"):
                 size_bytes = int(head.headers.get("Content-Length"))
                 size_str = f"{size_bytes / 1024 / 1024:.2f} MB"
@@ -1123,7 +1150,7 @@ def handle_scan_downloads(job: dict) -> None:
     # مرحله ۱: Playwright
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(1000)
         all_hrefs = page.evaluate("""() => {
@@ -1159,7 +1186,7 @@ def handle_scan_downloads(job: dict) -> None:
         try:
             s = requests.Session()
             s.headers.update({"User-Agent": USER_AGENT})
-            resp = s.get(url, timeout=10)
+            resp = s.get(url, timeout=10, proxies=proxy)
             if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
                 soup = BeautifulSoup(resp.text, "html.parser")
                 links_to_crawl = []
@@ -1177,7 +1204,7 @@ def handle_scan_downloads(job: dict) -> None:
                 for link in links_to_crawl[:15]:
                     if time.time() - start_time > 60:
                         break
-                    found = crawl_for_download_link(link, max_depth=1, max_pages=5, timeout_seconds=10)
+                    found = crawl_for_download_link(link, max_depth=1, max_pages=5, timeout_seconds=10, proxies=proxy)
                     if found:
                         add_result(found)
                 elapsed = time.time() - start_time
@@ -1190,7 +1217,6 @@ def handle_scan_downloads(job: dict) -> None:
         _done_job(job)
         return
 
-    # تبدیل به فرمت found_downloads پیشین
     found_downloads = [{"url": r["url"], "name": r["name"], "size": r["size"]} for r in all_results]
     session["found_downloads"] = found_downloads
     session["found_downloads_page"] = 0
@@ -1208,9 +1234,10 @@ def handle_scan_videos(job: dict) -> None:
         _done_job(job)
         return
 
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         videos = scan_videos_smart(page)
         if not videos:
@@ -1243,7 +1270,6 @@ def handle_scan_videos(job: dict) -> None:
             pw.stop()
 
 
-# ★ ارتقا یافته: نمایش همهٔ لینک‌ها با توضیح کامل
 def handle_extract_commands(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
@@ -1269,7 +1295,6 @@ def handle_extract_commands(job: dict) -> None:
     _done_job(job)
 
 
-# ★ ارتقا یافته: دسته‌بندی هوشمند کامل
 def handle_smart_analyze(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
@@ -1320,7 +1345,6 @@ def handle_smart_analyze(job: dict) -> None:
     _done_job(job)
 
 
-# ★ ارتقا یافته: تحلیل سورس با Playwright
 def handle_source_analyze(job: dict) -> None:
     chat_id = job["chat_id"]
     session = storage.get_session(chat_id)
@@ -1330,9 +1354,10 @@ def handle_source_analyze(job: dict) -> None:
         _done_job(job)
         return
 
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
         html = page.content()
@@ -1355,7 +1380,6 @@ def handle_source_analyze(job: dict) -> None:
                 for m in matches:
                     found_urls.add(m)
 
-        # حذف تبلیغات
         clean_urls = [u for u in found_urls
                       if not any(ad in u for ad in AD_DOMAINS) and
                       not any(kw in u.lower() for kw in BLOCKED_AD_KEYWORDS)]
@@ -1419,12 +1443,24 @@ def handle_download_all_found(job: dict) -> None:
         if not files:
             worker.send_message(chat_id, "⛔ هیچ فایلی دانلود نشد.")
         else:
-            zip_path = os.path.join(job_dir, "all_found.zip")
-            compress_level = 9 if compression == "high" else zipfile.ZIP_DEFLATED
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=compress_level if isinstance(compress_level, int) else None):
-                for f in files:
-                    zf.write(f, os.path.basename(f))
-            _send_file_parts(chat_id, zip_path, use_zip=False, label="فایل‌های یافت شده")
+            if compression == "high":
+                # 7z کل پوشه
+                archive_path = compress_7z(job_dir)  # ممکن است کل پوشه را فشرده کند یا فایل‌ها را جداگانه.
+                # اما compress_7z برای یک فایل طراحی شده، لذا بهتر است پوشه را زیپ کنیم و سپس 7z کنیم
+                zip_path = os.path.join(job_dir, "all_found.zip")
+                with zipfile.ZipFile(zip_path, "w") as zf:
+                    for f in files:
+                        zf.write(f, os.path.basename(f))
+                archive_path = compress_7z(zip_path)
+                parts = split_file_binary(archive_path, "all_found", ".7z")
+            else:
+                zip_path = os.path.join(job_dir, "all_found.zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in files:
+                        zf.write(f, os.path.basename(f))
+                parts = split_file_binary(zip_path, "all_found", ".zip")
+            for part_path in parts:
+                worker.send_document(chat_id, part_path, caption="فایل‌های یافت شده")
         _done_job(job)
     except Exception as e:
         worker.send_message(chat_id, f"❌ خطا: {e}")
@@ -1463,9 +1499,10 @@ def process_captcha_job(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
         page.evaluate("""
@@ -1515,10 +1552,12 @@ def process_fullpage_screenshot(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
+    session = storage.get_session(chat_id)
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     spath = os.path.join(job_dir, "screenshot.png")
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.screenshot(path=spath, full_page=True)
         worker.send_document(chat_id, spath)
@@ -1547,9 +1586,10 @@ def process_interactive_scan(job: dict) -> None:
         _done_job(job)
         return
 
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         elements = page.evaluate("""
         () => {
@@ -1621,10 +1661,11 @@ def process_interactive_execute(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     spath = os.path.join(job_dir, "result.png")
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         selector = target["selector"]
         if not selector:
@@ -1632,7 +1673,6 @@ def process_interactive_execute(job: dict) -> None:
             _done_job(job)
             return
 
-        # رفع timeout: کلیک روی فیلد قبل از fill
         page.click(selector)
         page.wait_for_timeout(500)
         page.fill(selector, user_text)
@@ -1663,7 +1703,7 @@ def process_interactive_execute(job: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ★ قابلیت جدید: API Hunter
+# API Hunter
 # ---------------------------------------------------------------------------
 def process_api_hunter_job(job: dict) -> None:
     chat_id = job["chat_id"]
@@ -1674,10 +1714,11 @@ def process_api_hunter_job(job: dict) -> None:
         _done_job(job)
         return
 
+    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
-    capture = None  # برای ارجاع در finally
+    capture = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
 
@@ -1693,9 +1734,8 @@ def process_api_hunter_job(job: dict) -> None:
 
         page.on("response", capture)
         page.wait_for_timeout(5000)
-        page.remove_listener("response", capture)  # اصلاح
+        page.remove_listener("response", capture)
 
-        # یکتاسازی
         seen = set()
         unique = []
         for item in api_calls:
@@ -1721,7 +1761,6 @@ def process_api_hunter_job(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا در API Hunter: {e}")
         _done_job(job)
     finally:
-        # ایمن‌سازی حذف listener
         try:
             if page and capture:
                 page.remove_listener("response", capture)
