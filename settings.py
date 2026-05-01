@@ -65,7 +65,7 @@ LIMITS = {
         "screenshot":         (2, 3600, None),
         "2x_screenshot":      (0, 3600, None),
         "4k_screenshot":      (0, 3600, None),
-        "download":           (1, 3600, 10 * 1024 * 1024),
+        "download":           (1, 3600, 10 * 1024 * 1024),          # ۱۰ مگابایت
         "record_video":       (0, 3600, None),
         "scan_downloads":     (0, 3600, None),
         "scan_videos":        (0, 3600, None),
@@ -77,7 +77,7 @@ LIMITS = {
         "screenshot":         (2, 3600, None),
         "2x_screenshot":      (1, 3600, None),
         "4k_screenshot":      (1, 3600, None),
-        "download":           (2, 3600, 100 * 1024 * 1024),
+        "download":           (2, 3600, 100 * 1024 * 1024),          # ۱۰۰ مگابایت
         "record_video":       (1, 3600, None),
         "scan_downloads":     (1, 3600, None),
         "scan_videos":        (1, 3600, None),
@@ -89,7 +89,7 @@ LIMITS = {
         "screenshot":         (10, 3600, None),
         "2x_screenshot":      (5, 3600, None),
         "4k_screenshot":      (3, 3600, None),
-        "download":           (5, 3600, 600 * 1024 * 1024),
+        "download":           (5, 3600, 600 * 1024 * 1024),          # ۶۰۰ مگابایت
         "record_video":       (3, 3600, None),
         "scan_downloads":     (2, 3600, None),
         "scan_videos":        (5, 3600, None),
@@ -193,6 +193,7 @@ default_settings = {
     "video_format": "webm",                # webm, mkv, mp4
     "incognito_mode": False,
     "video_delivery": "split",             # split, zip
+    "compression_level": "normal",         # "normal" یا "high"
     "video_resolution": "720p",
     "crawler_mode": "normal",              # normal, medium, deep
     "crawler_layers": 2,
