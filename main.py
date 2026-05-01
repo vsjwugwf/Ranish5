@@ -74,7 +74,6 @@ def main_menu_keyboard(is_admin: bool, subscription: str) -> dict:
     ]
     if is_admin:
         kb.append([{"text": "🛠️ پنل ادمین", "callback_data": "menu_admin"}])
-    # ★ Torrent حذف شد
     kb.append([{"text": "🕸️ خزنده وحشی", "callback_data": "menu_crawler"}])
     return {"inline_keyboard": kb}
 
@@ -96,6 +95,8 @@ def settings_keyboard(session: dict) -> dict:
     resolution = s.get("video_resolution", "720p")
     comp = s.get("compression_level", "normal")
     comp_text = "فشرده" if comp == "high" else "عادی"
+    proxy_mode = s.get("proxy_mode", "off")
+    proxy_text = {"off": "بدون پروکسی", "warp": "Warp", "tor": "Tor", "free": "رایگان"}.get(proxy_mode, "نامشخص")
 
     kb = [
         [{"text": f"⏱️ زمان ضبط: {rec_time}s", "callback_data": "set_rec"}],
@@ -109,6 +110,7 @@ def settings_keyboard(session: dict) -> dict:
          {"text": f"📦 ارسال: {vid_del}", "callback_data": "set_viddel"}],
         [{"text": f"📺 کیفیت: {resolution}", "callback_data": "set_resolution"}],
         [{"text": f"📦 فشرده‌سازی: {comp_text}", "callback_data": "set_compression"}],
+        [{"text": f"🛡️ پروکسی: {proxy_text}", "callback_data": "set_proxy"}],
         [{"text": "🔙 بازگشت", "callback_data": "back_main"}],
     ]
     return {"inline_keyboard": kb}
@@ -243,15 +245,13 @@ def handle_message(chat_id: int, text: str):
     if text == "/start":
         session["state"] = "idle"
         session["click_counter"] = 0
-        session.pop("browser_links", None)
-        session.pop("browser_url", None)
-        session.pop("interactive_elements", None)
-        session.pop("crawler_pending_url", None)
         session.pop("status_message_id", None)
+        # دیگر browser_links و ... را پاک نکن تا مرورگر پایدار بماند
         storage.set_session(chat_id, session)
 
         sub = session.get("subscription", "free")
-        if is_admin or sub in ("pro",):
+        # ★ فقط کاربران واقعاً free باید کد بزنند
+        if is_admin or sub != "free":
             worker.send_message(chat_id, "🤖 ربات آمادهٔ سرویس.", reply_markup=main_menu_keyboard(is_admin, sub))
         else:
             session["state"] = "waiting_subscription"
@@ -271,7 +271,7 @@ def handle_message(chat_id: int, text: str):
         worker.send_message(chat_id, "⏹️ عملیات لغو شد.", reply_markup=main_menu_keyboard(is_admin, session.get("subscription", "free")))
         return
 
-    # ---------- فرمان‌های ادمین (فقط همین دو) ----------
+    # ---------- فرمان‌های ادمین ----------
     if is_admin:
         if text == "/toggleservice":
             if service_disabled:
@@ -300,7 +300,7 @@ def handle_message(chat_id: int, text: str):
             worker.send_message(chat_id, "❌ کد نامعتبر است. دوباره تلاش کنید یا /cancel")
         return
 
-    # ★ قفل اشتراک برای کاربران free (غیر از /start و /cancel و فعال‌سازی)
+    # ★ قفل اشتراک برای کاربران free
     if not is_admin and session.get("subscription", "free") == "free":
         worker.send_message(chat_id, "⛔ ابتدا باید اشتراک خود را فعال کنید. /start را بزنید و کد را وارد کنید.")
         return
@@ -308,7 +308,6 @@ def handle_message(chat_id: int, text: str):
     # ---------- پردازش بر اساس وضعیت ----------
     state = session.get("state", "idle")
 
-    # ★ حالت‌های دریافت لینک (بدون waiting_url_torrent)
     if state in ("waiting_url_screenshot", "waiting_url_download", "waiting_url_browser", "waiting_url_record"):
         if not is_valid_url(text):
             worker.send_message(chat_id, "⛔ لینک نامعتبر است.")
@@ -349,7 +348,6 @@ def handle_message(chat_id: int, text: str):
         storage.enqueue_job(target_file, job)
         session["state"] = "idle"
         storage.set_session(chat_id, session)
-        # ★ بدون منوی اصلی
         worker.send_message(chat_id, "✅ کار در صف قرار گرفت.")
         return
 
@@ -401,7 +399,7 @@ def handle_message(chat_id: int, text: str):
             worker.send_message(chat_id, "⛔ لینک نامعتبر.")
             return
         session["crawler_pending_url"] = text
-        session["state"] = "awaiting_crawler_confirmation"      # قفل کردن state
+        session["state"] = "awaiting_crawler_confirmation"
         storage.set_session(chat_id, session)
         summary = f"🌐 شروع خزنده روی:\n{text}\nتنظیمات: {session['settings']['crawler_mode']}"
         kb = {"inline_keyboard": [[
@@ -617,13 +615,28 @@ def handle_callback(cq: dict):
     elif data.startswith("set_"):
         s = session.setdefault("settings", {})
         key = data[4:]
+
+        # ★ پروکسی
+        if key == "proxy":
+            current = s.get("proxy_mode", "off")
+            modes = ["off", "warp", "tor", "free"]
+            idx = modes.index(current) if current in modes else 0
+            s["proxy_mode"] = modes[(idx + 1) % len(modes)]
+            storage.set_session(chat_id, session)
+            proxy_text = {"off": "بدون پروکسی", "warp": "Warp", "tor": "Tor", "free": "رایگان"}.get(s["proxy_mode"], "نامشخص")
+            worker.answer_callback_query(cq_id, f"پروکسی: {proxy_text}")
+            if "last_settings_msg_id" in session:
+                kb = settings_keyboard(session)
+                edit_reply_markup(chat_id, session["last_settings_msg_id"], kb)
+            return
+
         if key == "rec":
             session["state"] = "waiting_record_time"
             storage.set_session(chat_id, session)
             worker.send_message(chat_id, "⏱️ زمان ضبط (۱-۱۸۰۰ ثانیه):")
             return
 
-        # toggle مخصوص فشرده‌سازی
+        # فشرده‌سازی
         if key == "compression":
             current = s.get("compression_level", "normal")
             s["compression_level"] = "high" if current == "normal" else "normal"
@@ -634,7 +647,6 @@ def handle_callback(cq: dict):
                 edit_reply_markup(chat_id, session["last_settings_msg_id"], kb)
             return
 
-        # سایر تنظیمات چرخشی
         choices_map = {
             "dlmode": ["store", "stream", "adm"],
             "brwmode": ["text", "media", "explorer"],
