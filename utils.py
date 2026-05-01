@@ -99,13 +99,14 @@ def split_file_binary(file_path: str, prefix: str, ext: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# ۴. ایجاد فایل zip و در صورت نیاز تقسیم آن
+# ۴. ایجاد فایل zip و در صورت نیاز تقسیم آن (اصلاح‌شده)
 # ---------------------------------------------------------------------------
-def create_zip_and_split(src: str, base: str) -> List[str]:
+def create_zip_and_split(src: str, base: str, compression: str = "normal") -> List[str]:
     """
     فایل *src* را در یک فایل zip قرار می‌دهد. اگر حجم آرشیو از
     ZIP_PART_SIZE بیشتر شد، آن را تقسیم کرده و فایل اصلی zip
     را حذف می‌کند. در غیر این صورت همان تک‌فایل zip برگردانده می‌شود.
+    *compression* می‌تواند "normal" یا "high" باشد.
     """
     if not os.path.isfile(src):
         return []
@@ -113,9 +114,13 @@ def create_zip_and_split(src: str, base: str) -> List[str]:
     dir_name = os.path.dirname(src)
     zip_path = os.path.join(dir_name, f"{base}.zip")
 
-    # ساخت zip با فشرده‌سازی
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(src, arcname=os.path.basename(src))
+    # ساخت zip با فشرده‌سازی متناسب
+    if compression == "high":
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.write(src, arcname=os.path.basename(src))
+    else:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(src, arcname=os.path.basename(src))
 
     zip_size = os.path.getsize(zip_path)
     if zip_size <= ZIP_PART_SIZE:
