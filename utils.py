@@ -3,8 +3,10 @@ import time
 import queue
 import zipfile
 import re
+import shutil
+import subprocess
 from urllib.parse import urlparse, urljoin, unquote
-from typing import Optional, List, Tuple, Set
+from typing import Optional, List, Tuple, Set, Dict
 
 import requests
 from bs4 import BeautifulSoup
@@ -21,7 +23,6 @@ def is_direct_file_url(url: str) -> bool:
     معیار: پسوند مسیر (بدون کوئری) جزو فهرست شناخته‌شده باشد، یا
     پسوندی با حروف، ارقام، _ و - تا طول ۱۰ کاراکتر داشته باشد.
     """
-    # پسوندهای شناخته‌شده (حروف کوچک)
     known_extensions = {
         "zip", "rar", "7z", "pdf", "mp4", "mkv", "avi", "mp3", "exe", "apk",
         "dmg", "iso", "tar", "gz", "bz2", "xz", "whl", "deb", "rpm", "msi",
@@ -40,7 +41,6 @@ def is_direct_file_url(url: str) -> bool:
     if ext in known_extensions:
         return True
 
-    # پسوند ناشناخته: فقط حروف، ارقام، _ و - با طول ≤ ۱۰
     if re.fullmatch(r"[a-zA-Z0-9_-]{1,10}", ext):
         return True
 
@@ -99,7 +99,7 @@ def split_file_binary(file_path: str, prefix: str, ext: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# ۴. ایجاد فایل zip و در صورت نیاز تقسیم آن (اصلاح‌شده)
+# ۴. ایجاد فایل zip و در صورت نیاز تقسیم آن
 # ---------------------------------------------------------------------------
 def create_zip_and_split(src: str, base: str, compression: str = "normal") -> List[str]:
     """
@@ -114,7 +114,6 @@ def create_zip_and_split(src: str, base: str, compression: str = "normal") -> Li
     dir_name = os.path.dirname(src)
     zip_path = os.path.join(dir_name, f"{base}.zip")
 
-    # ساخت zip با فشرده‌سازی متناسب
     if compression == "high":
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             zf.write(src, arcname=os.path.basename(src))
@@ -126,7 +125,6 @@ def create_zip_and_split(src: str, base: str, compression: str = "normal") -> Li
     if zip_size <= ZIP_PART_SIZE:
         return [zip_path]
 
-    # تقسیم zip و حذف نسخهٔ اولیه
     parts = split_file_binary(zip_path, prefix=base, ext=".zip")
     os.remove(zip_path)
     return parts
@@ -140,6 +138,7 @@ def crawl_for_download_link(
     max_depth: int = 1,
     max_pages: int = 10,
     timeout_seconds: int = 30,
+    proxies: Optional[Dict] = None,
 ) -> Optional[str]:
     """
     از *start_url* شروع کرده و حداکثر *max_pages* صفحه را تا
@@ -172,11 +171,10 @@ def crawl_for_download_link(
         pages_visited += 1
 
         try:
-            resp = session.get(cur_url, timeout=10)
+            resp = session.get(cur_url, timeout=10, proxies=proxies)
         except Exception:
             continue
 
-        # اگر URL نهایی (پس از redirect) خودش مستقیم فایل باشد
         final_url = resp.url
         if is_direct_file_url(final_url):
             return final_url
@@ -185,7 +183,6 @@ def crawl_for_download_link(
         if "text/html" not in content_type:
             continue
 
-        # پارس HTML و جستجوی لینک‌ها
         try:
             soup = BeautifulSoup(resp.text, "html.parser")
         except Exception:
@@ -211,7 +208,6 @@ def categorize_url(url: str, content_type: Optional[str] = None) -> str:
     "image" / "video" / "pdf" / "archive" / "page"
     اولویت با *content_type* داده می‌شود؛ در غیر آن پسوند مسیر بررسی می‌شود.
     """
-    # اگر content‑type موجود باشد
     if content_type:
         ct = content_type.lower()
         if "image" in ct:
@@ -221,7 +217,6 @@ def categorize_url(url: str, content_type: Optional[str] = None) -> str:
         if "pdf" in ct:
             return "pdf"
 
-    # تشخیص بر اساس پسوند مسیر
     path = unquote(urlparse(url).path)
     filename = os.path.basename(path)
     if "." in filename:
@@ -255,3 +250,52 @@ def is_valid_url(url: str) -> bool:
 def safe_log(msg: str) -> None:
     """پیام *msg* را همراه با زمان جاری چاپ می‌کند."""
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# ۹. فشرده‌سازی با 7z (در صورت موجود بودن)
+# ---------------------------------------------------------------------------
+def compress_7z(file_path: str) -> str:
+    """
+    فایل ورودی را با 7z با حداکثر فشرده‌سازی فشرده می‌کند.
+    خروجی: مسیر فایل 7z. در صورت نبود 7z، فایل zip معمولی با
+    compresslevel=9 ساخته می‌شود.
+    """
+    out_path = file_path + ".7z"
+    if shutil.which("7z"):
+        try:
+            subprocess.run(
+                ["7z", "a", "-mx=9", out_path, file_path],
+                check=True, capture_output=True, timeout=300
+            )
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception:
+            pass
+    # fallback به zip معمولی با فشرده‌سازی بالا
+    zp = file_path + ".zip"
+    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.write(file_path, os.path.basename(file_path))
+    return zp
+
+
+# ---------------------------------------------------------------------------
+# ۱۰. دریافت دیکشنری پروکسی بر اساس حالت
+# ---------------------------------------------------------------------------
+def get_proxy_dict(proxy_mode: str) -> Optional[Dict[str, str]]:
+    """
+    بر اساس *proxy_mode*، دیکشنری پروکسی مناسب برای requests
+    را برمی‌گرداند.
+    *proxy_mode* می‌تواند "off", "warp", "tor", "free" باشد.
+    """
+    proxy_mode = proxy_mode or "off"
+    if proxy_mode == "off":
+        return None
+    elif proxy_mode == "warp":
+        return {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"}
+    elif proxy_mode == "tor":
+        return {"http": "socks5://127.0.0.1:9050", "https": "socks5://127.0.0.1:9050"}
+    elif proxy_mode == "free":
+        # یک پروکسی رایگان نمونه – در آینده از proxy_utils خوانده می‌شود
+        return {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"}
+    return None
