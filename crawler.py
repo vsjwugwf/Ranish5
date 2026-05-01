@@ -8,6 +8,7 @@ import re
 import hashlib
 import threading
 import traceback
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple, Set
 from urllib.parse import urljoin, urlparse
 
@@ -24,7 +25,14 @@ from settings import (
     CRAWLER_MODES,
     ZIP_PART_SIZE,
 )
-from utils import is_direct_file_url, categorize_url, get_filename_from_url, is_valid_url, safe_log
+from utils import (
+    is_direct_file_url,
+    categorize_url,
+    get_filename_from_url,
+    is_valid_url,
+    safe_log,
+    split_file_binary,
+)
 
 # ---------------------------------------------------------------------------
 # تابع ورودی همگام – توسط jobs.py / main.py صدا زده می‌شود
@@ -46,9 +54,8 @@ def start_crawl(
         except Exception as e:
             safe_log(f"خزنده با خطای مرگبار متوقف شد: {e}")
             traceback.print_exc()
-            # تلاش برای اطلاع‌رسانی به کاربر
             try:
-                progress_callback(f"❌ خزنده با خطا متوقف شد: {e}")
+                crawler._invoke_callback(f"❌ خزنده با خطا متوقف شد: {e}")
             except:
                 pass
 
@@ -75,7 +82,7 @@ class Crawler:
         self.stop_event = stop_event
         self.progress_callback = progress_callback
 
-        # تنظیمات
+        # تنظیمات خزنده
         self.mode = settings.get("crawler_mode", "normal")
         self.layers = settings.get("crawler_layers", 2)
         self.max_pages = settings.get("crawler_limit", 0)
@@ -88,6 +95,10 @@ class Crawler:
         self.use_sitemap = settings.get("crawler_sitemap", False)
         self.priority = settings.get("crawler_priority", False)
         self.js_mode = settings.get("crawler_js", False)
+
+        # ★ تنظیمات پروکسی و فشرده‌سازی
+        self.proxy_mode = settings.get("proxy_mode", "off")
+        self.compression = settings.get("compression_level", "normal")
 
         # عمق و صفحات از CRAWLER_MODES
         mode_cfg = CRAWLER_MODES.get(self.mode, CRAWLER_MODES["normal"])
@@ -104,7 +115,6 @@ class Crawler:
         self.total_errors = 0
         self.total_size = 0
 
-        # شمارنده‌های جزئی برای گزارش نهایی
         self.successful_ops = 0
         self.failed_ops = 0
         self.images_count = 0
@@ -112,10 +122,7 @@ class Crawler:
         self.files_count = 0
         self.unknown_count = 0
 
-        # زمان شروع
         self.start_time = time.time()
-
-        # محدودیت دامنه‌ای برای احترام به سرور
         self.domain_last_request: Dict[str, float] = {}
 
         # پوشهٔ نتایج
@@ -128,7 +135,6 @@ class Crawler:
         self.csv_path = os.path.join(self.results_dir, "full_report", "crawl_log.csv")
         self.report_html_path = os.path.join(self.results_dir, "full_report", "report.html")
 
-        # در run باز می‌شوند
         self.errors_log = None
         self.csv_file = None
         self.csv_writer = None
@@ -139,9 +145,26 @@ class Crawler:
         self.context = None
         self.session = None
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # کمک‌کننده برای فراخوانی callback (همگام یا async)
+    # -------------------------------------------------------------------
+    def _invoke_callback(self, msg: str, file_path: str = None):
+        try:
+            cb = self.progress_callback
+            if asyncio.iscoroutinefunction(cb):
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(cb(msg, file_path=file_path))
+                finally:
+                    loop.close()
+            else:
+                cb(msg, file_path=file_path)
+        except Exception as e:
+            safe_log(f"crawler callback error: {e}")
+
+    # -------------------------------------------------------------------
     # آماده‌سازی پوشه‌ها
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def _prepare_directories(self):
         os.makedirs(self.results_dir, exist_ok=True)
         os.makedirs(os.path.join(self.results_dir, "full_report"), exist_ok=True)
@@ -151,19 +174,18 @@ class Crawler:
             os.makedirs(os.path.join(layer_dir, "downloads"), exist_ok=True)
             os.makedirs(os.path.join(layer_dir, "screenshots"), exist_ok=True)
 
-    # -----------------------------------------------------------------------
-    # درج خطا در فایل errors.log
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # ثبت خطا در فایل errors.log
+    # -------------------------------------------------------------------
     def _log_error(self, msg: str):
-        """ثبت خطا در فایل errors.log با flush فوری"""
         if self.errors_log:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             self.errors_log.write(f"[{timestamp}] {msg}\n")
             self.errors_log.flush()
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # احترام به تأخیر دامنه
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def _respect_delay(self, url: str):
         domain = urlparse(url).hostname
         if not domain:
@@ -174,9 +196,9 @@ class Crawler:
             time.sleep(DOMAIN_DELAY - (now - last))
         self.domain_last_request[domain] = time.time()
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # مسدودساز تبلیغات
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def _adblock_router(self, route: Route):
         url = route.request.url
         try:
@@ -193,14 +215,24 @@ class Crawler:
             return
         route.continue_()
 
-    # -----------------------------------------------------------------------
-    # استخراج المان‌های قابل کلیک (راند ۱)
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # دریافت دیکشنری پروکسی
+    # -------------------------------------------------------------------
+    def _get_proxy(self) -> Optional[Dict]:
+        if self.proxy_mode == "off":
+            return None
+        elif self.proxy_mode == "warp":
+            return {"server": "socks5://127.0.0.1:40000"}
+        elif self.proxy_mode == "tor":
+            return {"server": "socks5://127.0.0.1:9050"}
+        elif self.proxy_mode == "free":
+            return {"server": "socks5://127.0.0.1:1080"}
+        return None
+
+    # -------------------------------------------------------------------
+    # راند ۱: اسکن المان‌های قابل کلیک
+    # -------------------------------------------------------------------
     def _scan_clickables(self, url: str, layer: int) -> Optional[List[Dict]]:
-        """
-        صفحه را باز می‌کند و تمام المان‌های قابل کلیک را شناسایی می‌کند.
-        خروجی به صورت JSON ذخیره می‌شود و اسکرین‌شات گرفته می‌شود.
-        """
         self._respect_delay(url)
         page = None
         try:
@@ -208,7 +240,6 @@ class Crawler:
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
-            # اسکریپت استخراج المان‌های قابل کلیک
             js = """
             () => {
                 const items = [];
@@ -220,7 +251,6 @@ class Crawler:
                         items.push({type, text, selector, href});
                     }
                 }
-                // تگ‌های معمولی
                 document.querySelectorAll('a[href]').forEach(a => {
                     let href = a.href;
                     if (href && href.startsWith('http')) {
@@ -234,7 +264,6 @@ class Crawler:
                     try { if (href) href = new URL(href, document.baseURI).href; } catch(e) {}
                     add('button', text, getUniqueSelector(el), href || '');
                 });
-                // المان‌هایی با cursor: pointer یا role="button"
                 const allElements = document.querySelectorAll('*');
                 for (const el of allElements) {
                     if (el.tagName === 'A' || el.tagName === 'BUTTON' || el.tagName === 'INPUT') continue;
@@ -272,38 +301,33 @@ class Crawler:
             }
             """
             clickables = page.evaluate(js)
-            # ذخیره در فایل JSON
+
             layer_clickable_dir = os.path.join(self.results_dir, f"layer_{layer}", "clickable")
             json_path = os.path.join(layer_clickable_dir, "clickable.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(clickables, f, ensure_ascii=False, indent=2)
 
-            # اسکرین‌شات
             screenshot_path = os.path.join(self.results_dir, f"layer_{layer}", "screenshots", "page.png")
             page.screenshot(path=screenshot_path, full_page=True)
 
             self.total_clickables += len(clickables)
-            self._send_progress(f"🔍 راند ۱ لایه {layer} به پایان رسید. {len(clickables)} المان قابل کلیک یافت شد.")
+            self._invoke_callback(f"🔍 راند ۱ لایه {layer} به پایان رسید. {len(clickables)} المان قابل کلیک یافت شد.")
             return clickables
         except Exception as e:
             self.total_errors += 1
             self.failed_ops += 1
             msg = f"خطا در راند ۱ لایه {layer} ({url}): {e}"
             self._log_error(msg)
-            self._send_progress(f"❌ {msg}")
+            self._invoke_callback(f"❌ {msg}")
             return None
         finally:
             if page:
                 page.close()
 
-    # -----------------------------------------------------------------------
-    # شنود API و دانلود (راند ۲)
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # راند ۲: اسکن و دانلود محتوا
+    # -------------------------------------------------------------------
     def _scan_downloads(self, url: str, layer: int):
-        """
-        صفحه را دوباره باز می‌کند (یا می‌تواند همان page قبلی باشد اما بهتر است مستقل باشد)
-        و محتوای قابل دانلود را استخراج و دانلود می‌کند.
-        """
         self._respect_delay(url)
         page = None
         try:
@@ -317,6 +341,8 @@ class Crawler:
             links_file = open(links_list_path, "w", encoding="utf-8")
 
             downloaded_count = 0
+            proxy = self._get_proxy()
+            proxies = {"http": proxy["server"], "https": proxy["server"]} if proxy else None
 
             # ----- مرحله ۱: لینک‌های مستقیم از DOM -----
             dom_urls = page.evaluate("""() => {
@@ -336,7 +362,7 @@ class Crawler:
                     filter_key = cat if cat in self.file_filters else "unknown"
                     if not self.file_filters.get(filter_key, True):
                         continue
-                    if self._download_file(link, downloads_dir):
+                    if self._download_file(link, downloads_dir, proxies):
                         downloaded_count += 1
                         if cat == "image":
                             self.images_count += 1
@@ -347,9 +373,6 @@ class Crawler:
                         else:
                             self.unknown_count += 1
                         links_file.write(link + "\n")
-                else:
-                    # ممکن است محتوای غیرمستقیم قابل دانلود باشد (مثلاً m3u8)
-                    pass  # API hunter در مرحله بعدی
 
             # ----- مرحله ۲: شنود APIهای شبکه -----
             api_calls = set()
@@ -365,7 +388,7 @@ class Crawler:
             api_download_dir = os.path.join(downloads_dir, "api")
             os.makedirs(api_download_dir, exist_ok=True)
             for api_url in api_calls:
-                if self._download_file(api_url, api_download_dir, guess_extension=True):
+                if self._download_file(api_url, api_download_dir, proxies, guess_extension=True):
                     downloaded_count += 1
                     self.unknown_count += 1
                     links_file.write(api_url + "\n")
@@ -389,7 +412,7 @@ class Crawler:
                 cat = categorize_url(hid_url)
                 if not self.file_filters.get(cat, True):
                     continue
-                if self._download_file(hid_url, downloads_dir):
+                if self._download_file(hid_url, downloads_dir, proxies):
                     downloaded_count += 1
                     if cat == "video":
                         self.videos_count += 1
@@ -401,63 +424,59 @@ class Crawler:
 
             links_file.close()
             self.total_files += downloaded_count
-            self._send_progress(f"📥 راند ۲ لایه {layer} به پایان رسید. {downloaded_count} فایل دانلود شد.")
+            self._invoke_callback(f"📥 راند ۲ لایه {layer} به پایان رسید. {downloaded_count} فایل دانلود شد.")
         except Exception as e:
             self.total_errors += 1
             self.failed_ops += 1
             msg = f"خطا در راند ۲ لایه {layer} ({url}): {e}"
             self._log_error(msg)
-            self._send_progress(f"❌ {msg}")
+            self._invoke_callback(f"❌ {msg}")
         finally:
             if page:
                 page.close()
             if 'links_file' in locals() and not links_file.closed:
                 links_file.close()
 
-    # -----------------------------------------------------------------------
-    # دانلود یک فایل مشخص
-    # -----------------------------------------------------------------------
-    def _download_file(self, file_url: str, save_dir: str, guess_extension: bool = False) -> bool:
-        """
-        دانلود فایل و ذخیره در save_dir.
-        اگر guess_extension=True باشد، پسوند را از Content-Type حدس می‌زند.
-        """
+    # -------------------------------------------------------------------
+    # دانلود یک فایل و ذخیره
+    # -------------------------------------------------------------------
+    def _download_file(self, file_url: str, save_dir: str, proxies: Optional[Dict] = None, guess_extension: bool = False) -> bool:
         try:
             fname = get_filename_from_url(file_url)
             if '.' not in fname and guess_extension:
-                # حدس پسوند
-                head = requests.head(file_url, timeout=10, allow_redirects=True)
-                ct = head.headers.get("content-type", "")
-                if "json" in ct:
-                    ext = ".json"
-                elif "xml" in ct:
-                    ext = ".xml"
-                elif "text/plain" in ct:
-                    ext = ".txt"
-                elif "octet-stream" in ct:
-                    ext = ".bin"
-                else:
-                    ext = ".dat"
-                fname += ext
+                try:
+                    head = requests.head(file_url, timeout=10, allow_redirects=True, proxies=proxies)
+                    ct = head.headers.get("content-type", "")
+                    if "json" in ct:
+                        ext = ".json"
+                    elif "xml" in ct:
+                        ext = ".xml"
+                    elif "text/plain" in ct:
+                        ext = ".txt"
+                    elif "octet-stream" in ct:
+                        ext = ".bin"
+                    else:
+                        ext = ".dat"
+                    fname += ext
+                except:
+                    fname += ".dat"
 
             fpath = os.path.join(save_dir, fname)
-            # جلوگیری از بازنویسی
             base, ext = os.path.splitext(fname)
             counter = 1
             while os.path.exists(fpath):
                 fpath = os.path.join(save_dir, f"{base}_{counter}{ext}")
                 counter += 1
 
-            resp = requests.get(file_url, stream=True, timeout=30)
+            resp = requests.get(file_url, stream=True, timeout=30, proxies=proxies)
             resp.raise_for_status()
             size = 0
             with open(fpath, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     if self.total_size + len(chunk) > MAX_CRAWL_SIZE:
-                        # بیش از حد مجاز
                         f.close()
                         os.remove(fpath)
-                        self._send_progress("⛔ حجم کل خزنده به حد مجاز رسید. دانلود فایل جدید متوقف شد.")
+                        self._invoke_callback("⛔ حجم کل خزنده به حد مجاز رسید. دانلود فایل جدید متوقف شد.")
                         return False
                     f.write(chunk)
                     self.total_size += len(chunk)
@@ -467,26 +486,27 @@ class Crawler:
             self._log_error(f"دانلود ناموفق {file_url}: {e}")
             return False
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # ارسال پیام پیشرفت
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def _send_progress(self, msg: str):
-        try:
-            self.progress_callback(msg)
-        except:
-            pass
+        self._invoke_callback(msg)
 
-    # -----------------------------------------------------------------------
-    # اجرای اصلی خزنده
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # حلقهٔ اصلی خزنده
+    # -------------------------------------------------------------------
     def run(self):
-        # راه‌اندازی Playwright و Requests
+        # راه‌اندازی Playwright و Requests با پروکسی
+        proxy = self._get_proxy()
         self.pw = sync_playwright().start()
         self.browser = self.pw.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
-        self.context = self.browser.new_context(viewport={"width": 390, "height": 844})
+        context_kwargs = {"viewport": {"width": 390, "height": 844}}
+        if proxy:
+            context_kwargs["proxy"] = proxy
+        self.context = self.browser.new_context(**context_kwargs)
         if self.adblock:
             self.context.route("**/*", self._adblock_router)
         self.session = requests.Session()
@@ -500,23 +520,21 @@ class Crawler:
         self.csv_writer.writerow(["url", "status", "content_type", "type", "layer", "depth", "note"])
 
         try:
-            self._send_progress("🚀 خزنده شروع شد...")
+            self._invoke_callback("🚀 خزنده شروع شد...")
 
-            # Sitemap
             if self.use_sitemap:
                 self._fetch_sitemap()
 
-            # افزودن URL شروع
             self.queue.append((self.start_url, 1))
 
             while self.queue:
                 if self.stop_event.is_set():
                     break
                 if time.time() - self.start_time > self.max_time:
-                    self._send_progress("⏰ زمان خزنده به پایان رسید.")
+                    self._invoke_callback("⏰ زمان خزنده به پایان رسید.")
                     break
                 if self.total_pages >= self.max_pages:
-                    self._send_progress("📄 حد مجاز صفحات بازدیدشده رسید.")
+                    self._invoke_callback("📄 حد مجاز صفحات بازدیدشده رسید.")
                     break
 
                 url, depth = self.queue.pop(0)
@@ -527,28 +545,23 @@ class Crawler:
                 self.total_pages += 1
                 self._log_csv(url, "processing", "", "page", depth, "processing")
 
-                # اجرای راندها
                 clickables = self._scan_clickables(url, depth)
                 self._scan_downloads(url, depth)
 
-                # در صورت موفقیت (اگر خطایی نباشد) ops موفق افزایش یابد
-                # برای سادگی، اگر clickables برگردانده شود راند ۱ موفق بوده است.
                 if clickables is not None:
                     self.successful_ops += 1
                 else:
                     self.failed_ops += 1
 
-                # افزودن عناصر قابل کلیک به صف برای عمق‌های بعدی
                 if clickables and depth < self.max_depth:
                     for item in clickables:
                         href = item.get("href", "")
                         if href and href.startswith("http") and href not in self.visited:
                             self.queue.append((href, depth + 1))
 
-            # نهایی‌سازی
             self._finalize()
         except Exception as e:
-            self._send_progress(f"❌ خطای بحرانی: {e}")
+            self._invoke_callback(f"❌ خطای بحرانی: {e}")
             self._log_error(f"FATAL: {e}")
         finally:
             if self.errors_log:
@@ -564,9 +577,9 @@ class Crawler:
             if self.session:
                 self.session.close()
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # واکشی Sitemap
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def _fetch_sitemap(self):
         sitemap_urls = [
             urljoin(self.start_url, "/sitemap.xml"),
@@ -585,17 +598,17 @@ class Crawler:
             except:
                 pass
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # نوشتن یک ردیف در CSV
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     def _log_csv(self, url, status, content_type, typ, layer, depth, note=""):
         if self.csv_writer:
             self.csv_writer.writerow([url, status, content_type, typ, layer, depth, note])
             self.csv_file.flush()
 
-    # -----------------------------------------------------------------------
-    # پایان کار – گزارش‌گیری و ارسال ZIP
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # پایان کار – گزارش‌گیری و ارسال فایل نهایی
+    # -------------------------------------------------------------------
     def _finalize(self):
         # نوشتن all.txt
         total_ops = self.successful_ops + self.failed_ops
@@ -610,29 +623,35 @@ class Crawler:
             f.write(f"Total Pages Visited: {self.total_pages}\n")
             f.write(f"Total Download Size: {self.total_size / 1024 / 1024:.2f} MB\n")
 
-        # بستن errors.log اگر باز است
         if self.errors_log and not self.errors_log.closed:
-            # اگر فایل خالی است، "No errors." بنویس
             if os.path.getsize(self.errors_log_path) == 0:
                 self.errors_log.write("No errors.\n")
             self.errors_log.close()
 
-        # ساخت گزارش HTML ساده
         self._generate_html_report()
 
-        # ساخت ZIP از کل پوشه
-        zip_base = os.path.join(os.path.dirname(self.results_dir), os.path.basename(self.results_dir))
-        zip_path = shutil.make_archive(zip_base, 'zip', self.results_dir)
+        # ساخت ZIP نهایی با توجه به فشرده‌سازی
+        if self.compression == "high":
+            # ابتدا یک zip معمولی
+            zip_base = os.path.join(os.path.dirname(self.results_dir), os.path.basename(self.results_dir))
+            zip_path = shutil.make_archive(zip_base, 'zip', self.results_dir)
+            try:
+                from utils import compress_7z
+                final_path = compress_7z(zip_path)
+            except:
+                final_path = zip_path
+        else:
+            zip_base = os.path.join(os.path.dirname(self.results_dir), os.path.basename(self.results_dir))
+            final_path = shutil.make_archive(zip_base, 'zip', self.results_dir)
 
-        # ارسال فایل به کاربر
-        self.progress_callback("__FINAL_ZIP__", file_path=zip_path)
+        self._invoke_callback("__FINAL_ZIP__", file_path=final_path)
 
         # پاک‌سازی
         shutil.rmtree(self.results_dir, ignore_errors=True)
 
-    # -----------------------------------------------------------------------
-    # گزارش HTML مشابه قبل
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # گزارش HTML
+    # -------------------------------------------------------------------
     def _generate_html_report(self):
         counts = {
             "image": self.images_count,
