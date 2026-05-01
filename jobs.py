@@ -157,6 +157,9 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
         page.evaluate("window.scrollBy(0, 200)")
         page.wait_for_timeout(1000)
 
+        # حذف شنونده قبل از پردازش
+        page.remove_listener("response", _capture_response)
+
         seen = set(videos)
         for v in network_videos:
             if v not in seen:
@@ -480,7 +483,7 @@ def scan_videos_smart(page: Page) -> List[Dict[str, Any]]:
 
     page.on("response", capture)
     page.wait_for_timeout(3000)
-    page.off("response", capture)
+    page.remove_listener("response", capture)
 
     for u in network_urls:
         if u not in seen_urls:
@@ -740,13 +743,14 @@ def process_blind_download(job: dict) -> None:
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-def _send_file_parts(chat_id: int, file_path: str, use_zip: bool, label: str = "") -> None:
+def _send_file_parts(chat_id: int, file_path: str, use_zip: bool, label: str = "", compression: str = "normal") -> None:
     """
     ارسال فایل به صورت قطعه‌قطعه (با توجه به ZIP_PART_SIZE و نوع تحویل).
+    compression می‌تواند "normal" یا "high" باشد.
     """
     if use_zip:
         base = os.path.splitext(os.path.basename(file_path))[0]
-        parts = create_zip_and_split(file_path, base)
+        parts = create_zip_and_split(file_path, base, compression=compression)
     else:
         base, ext = os.path.splitext(os.path.basename(file_path))
         ext = ext if ext else ".bin"
@@ -768,6 +772,7 @@ def process_download_execute(job: dict) -> None:
     direct_link = extra.get("direct_link")
     fpath = extra.get("file_path")
     fname = extra.get("filename", "file")
+    compression = session["settings"].get("compression_level", "normal")
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
@@ -848,7 +853,7 @@ def process_download_execute(job: dict) -> None:
             return
 
         if pack_zip:
-            _send_file_parts(chat_id, final_file, use_zip=True, label=fname)
+            _send_file_parts(chat_id, final_file, use_zip=True, label=fname, compression=compression)
         else:
             if mode in ("store", "adm"):
                 _send_file_parts(chat_id, final_file, use_zip=False, label=fname)
@@ -882,6 +887,8 @@ def _download_segment(url: str, job_dir: str, fname: str, start: int, end: int, 
 def download_full_website(job: dict) -> None:
     chat_id = job["chat_id"]
     url = job["url"]
+    session = storage.get_session(chat_id)
+    compression = session["settings"].get("compression_level", "normal")
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
 
@@ -909,7 +916,7 @@ def download_full_website(job: dict) -> None:
         zip_base = os.path.join(job_dir, "website")
         zip_path = f"{zip_base}.zip"
         shutil.make_archive(zip_base, 'zip', job_dir)
-        _send_file_parts(chat_id, zip_path, use_zip=False, label="Website")
+        _send_file_parts(chat_id, zip_path, use_zip=False, label="Website", compression=compression)
         _done_job(job)
 
     except Exception:
@@ -927,7 +934,7 @@ def download_full_website(job: dict) -> None:
             zip_base = os.path.join(job_dir, "website")
             zip_path = f"{zip_base}.zip"
             shutil.make_archive(zip_base, 'zip', job_dir)
-            _send_file_parts(chat_id, zip_path, use_zip=False, label="Website (fallback)")
+            _send_file_parts(chat_id, zip_path, use_zip=False, label="Website (fallback)", compression=compression)
             _done_job(job)
         except Exception as e:
             worker.send_message(chat_id, f"❌ دانلود سایت ناموفق بود. ممکن است سایت در دسترس نباشد. ({e})")
@@ -956,6 +963,7 @@ def process_record_job(job: dict) -> None:
     video_format = settings.get("video_format", "webm")
     video_delivery = settings.get("video_delivery", "split")
     resolution = settings.get("video_resolution", "720p")
+    compression = settings.get("compression_level", "normal")
 
     w, h = ALLOWED_RESOLUTIONS.get(resolution, (1280, 720))
     job_dir = f"jobs/{job['job_id']}"
@@ -981,7 +989,6 @@ def process_record_job(job: dict) -> None:
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                   "--autoplay-policy=no-user-gesture-required"]
         )
-        # حذف record_video_fps – با آرگومان نامعتبر
         context = rec_browser.new_context(
             viewport={"width": w, "height": h},
             record_video_dir=job_dir,
@@ -1030,12 +1037,12 @@ def process_record_job(job: dict) -> None:
 
         video_zip = (video_delivery == "zip")
         if os.path.isfile(final_video_path):
-            _send_file_parts(chat_id, final_video_path, use_zip=video_zip, label="🎬 ویدیو")
+            _send_file_parts(chat_id, final_video_path, use_zip=video_zip, label="🎬 ویدیو", compression=compression)
         else:
             worker.send_message(chat_id, "❌ فایل ویدیو نهایی یافت نشد.")
 
         if audio_ok and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
-            _send_file_parts(chat_id, audio_path, use_zip=video_zip, label="🎵 صوت")
+            _send_file_parts(chat_id, audio_path, use_zip=video_zip, label="🎵 صوت", compression=compression)
 
         _done_job(job, RECORD_QUEUE_FILE)
     except Exception as e:
@@ -1088,7 +1095,7 @@ def handle_scan_downloads(job: dict) -> None:
         return
 
     deep_mode = session["settings"].get("deep_scan_mode", "logical")
-    send_message = worker.send_message  # کوتاه‌سازی
+    send_message = worker.send_message
 
     found_links: Set[str] = set()
     all_results: List[Dict[str, str]] = []
@@ -1393,6 +1400,7 @@ def handle_download_all_found(job: dict) -> None:
         _done_job(job)
         return
 
+    compression = session["settings"].get("compression_level", "normal")
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
     files = []
@@ -1412,7 +1420,8 @@ def handle_download_all_found(job: dict) -> None:
             worker.send_message(chat_id, "⛔ هیچ فایلی دانلود نشد.")
         else:
             zip_path = os.path.join(job_dir, "all_found.zip")
-            with zipfile.ZipFile(zip_path, "w") as zf:
+            compress_level = 9 if compression == "high" else zipfile.ZIP_DEFLATED
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=compress_level if isinstance(compress_level, int) else None):
                 for f in files:
                     zf.write(f, os.path.basename(f))
             _send_file_parts(chat_id, zip_path, use_zip=False, label="فایل‌های یافت شده")
@@ -1654,46 +1663,6 @@ def process_interactive_execute(job: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ★ قابلیت جدید: دانلود تورنت
-# ---------------------------------------------------------------------------
-def process_torrent_job(job: dict) -> None:
-    chat_id = job["chat_id"]
-    url = job["url"]  # می‌تواند magnet یا لینک فایل .torrent باشد
-    job_dir = f"jobs/{job['job_id']}"
-    os.makedirs(job_dir, exist_ok=True)
-
-    worker.send_message(chat_id, "🧲 درحال دانلود تورنت...")
-
-    try:
-        cmd = ["aria2c", "--dir", job_dir, "--seed-time=0", url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0 and "No such file or directory" not in result.stderr:
-            raise Exception(result.stderr[-200:])
-
-        # جمع‌آوری فایل‌های دانلودشده (به جز .aria2)
-        all_files = []
-        for root, _, files in os.walk(job_dir):
-            for file in files:
-                if not file.endswith(".aria2"):
-                    all_files.append(os.path.join(root, file))
-        if not all_files:
-            raise Exception("هیچ فایلی تکمیل نشد.")
-
-        zip_path = os.path.join(job_dir, "torrent_result.zip")
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            for fp in all_files:
-                zf.write(fp, os.path.basename(fp))
-        _send_file_parts(chat_id, zip_path, use_zip=False, label="Torrent Result")
-        _done_job(job)
-    except Exception as e:
-        worker.send_message(chat_id, f"❌ خطا در تورنت: {e}")
-        job["status"] = "failed"
-        storage.update_job(QUEUE_FILE, job)
-    finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
 # ★ قابلیت جدید: API Hunter
 # ---------------------------------------------------------------------------
 def process_api_hunter_job(job: dict) -> None:
@@ -1706,6 +1675,7 @@ def process_api_hunter_job(job: dict) -> None:
         return
 
     pw = browser = context = page = None
+    capture = None  # برای ارجاع در finally
     try:
         pw, browser, context, page = create_browser_context(url, incognito=False)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
@@ -1723,7 +1693,7 @@ def process_api_hunter_job(job: dict) -> None:
 
         page.on("response", capture)
         page.wait_for_timeout(5000)
-        page.off("response", capture)
+        page.remove_listener("response", capture)  # اصلاح
 
         # یکتاسازی
         seen = set()
@@ -1751,6 +1721,12 @@ def process_api_hunter_job(job: dict) -> None:
         worker.send_message(chat_id, f"❌ خطا در API Hunter: {e}")
         _done_job(job)
     finally:
+        # ایمن‌سازی حذف listener
+        try:
+            if page and capture:
+                page.remove_listener("response", capture)
+        except Exception:
+            pass
         if page:
             page.close()
         if context:
@@ -1762,7 +1738,7 @@ def process_api_hunter_job(job: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# نگاشت mode به تابع (شامل قابلیت‌های جدید)
+# نگاشت mode به تابع (بدون تورنت)
 # ---------------------------------------------------------------------------
 JOB_HANDLERS = {
     "browser": process_browser_job,
@@ -1785,6 +1761,5 @@ JOB_HANDLERS = {
     "interactive_scan": process_interactive_scan,
     "interactive_execute": process_interactive_execute,
     "record_video": process_record_job,
-    "torrent": process_torrent_job,          # ★ جدید
-    "api_hunter": process_api_hunter_job,    # ★ جدید
+    "api_hunter": process_api_hunter_job,
 }
