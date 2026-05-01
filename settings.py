@@ -194,6 +194,7 @@ default_settings = {
     "incognito_mode": False,
     "video_delivery": "split",             # split, zip
     "compression_level": "normal",         # "normal" یا "high"
+    "proxy_mode": "off",                   # off / warp / tor / free
     "video_resolution": "720p",
     "crawler_mode": "normal",              # normal, medium, deep
     "crawler_layers": 2,
