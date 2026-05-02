@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 from typing import Optional, Dict, List, Tuple, Any
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,60 +29,29 @@ from utils import (
     create_zip_and_split,
     safe_log,
     is_logical_download,
+    get_proxy_dict,
+    compress_7z,
 )
 import storage
 import worker
 
 # ---------------------------------------------------------------------------
-# توابع کمکی پروکسی و فشرده‌سازی 7z (از utils یا موقتی)
+# تابع کمکی: تبدیل پروکسی به فرمت Playwright
 # ---------------------------------------------------------------------------
-try:
-    from utils import get_proxy_dict
-except ImportError:
-    def get_proxy_dict(proxy_mode: str) -> Optional[Dict]:
-        """نگاشت حالت پروکسی به دیکشنری requests/Playwright"""
-        proxy_mode = proxy_mode or "off"
-        if proxy_mode == "off":
-            return None
-        elif proxy_mode == "warp":
-            return {"server": "socks5://127.0.0.1:40000"}
-        elif proxy_mode == "tor":
-            return {"server": "socks5://127.0.0.1:9050"}
-        elif proxy_mode == "free":
-            # یک پروکسی رایگان نمونه (در عمل باید داینامیک باشد)
-            return {"server": "socks5://127.0.0.1:1080"}
+def _get_playwright_proxy(proxy_mode: str) -> Optional[Dict]:
+    """دیکشنری پروکسی را از utils گرفته و به فرمت مناسب Playwright تبدیل می‌کند."""
+    proxy_dict = get_proxy_dict(proxy_mode)  # از utils.py
+    if proxy_dict is None:
         return None
+    # Playwright فقط کلید "server" را می‌خواهد
+    server = proxy_dict.get("http") or proxy_dict.get("https")
+    if server:
+        return {"server": server}
+    return None
 
-try:
-    from utils import compress_7z
-except ImportError:
-    def compress_7z(file_path: str) -> str:
-        """
-        فشرده‌سازی با 7z.
-        خروجی: مسیر فایل 7z. در صورت نبود 7z، فایل زیپ معمولی ساخته می‌شود.
-        """
-        out_path = file_path + ".7z"
-        if shutil.which("7z"):
-            try:
-                subprocess.run(["7z", "a", "-mx=9", out_path, file_path],
-                               check=True, capture_output=True, timeout=300)
-                if os.path.exists(out_path):
-                    return out_path
-            except Exception:
-                pass
-        # fallback به zip معمولی
-        import zipfile as zf
-        zp = file_path + ".zip"
-        with zf.ZipFile(zp, "w", zf.ZIP_DEFLATED, compresslevel=9) as z:
-            z.write(file_path, os.path.basename(file_path))
-        return zp
 
 # ---------------------------------------------------------------------------
-# دیگر خبری از متغیرهای سراسری Playwright نیست!
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# مسدود کردن تبلیغات (همچنان مورد نیاز)
+# مسدود کردن تبلیغات
 # ---------------------------------------------------------------------------
 def _adblock_router(route: Route) -> None:
     """مسدود کردن درخواست‌های تبلیغاتی بر اساس دامنه و کلمات کلیدی."""
@@ -107,12 +77,12 @@ def _adblock_router(route: Route) -> None:
 
 
 # ---------------------------------------------------------------------------
-# جایگزین get_or_create_context – یک نمونهٔ کامل و مستقل (با پروکسی)
+# ساخت یک نمونهٔ کاملاً جدید از Playwright (با پشتیبانی از پروکسی)
 # ---------------------------------------------------------------------------
 def create_browser_context(url: str, incognito: bool = False, proxy: Optional[Dict] = None):
     """
     یک نمونهٔ کاملاً جدید از Playwright می‌سازد و یک page آماده برمی‌گرداند.
-    *url* برای تنظیم route استفاده می‌شود (همهٔ درخواست‌ها از مسیریاب عبور می‌کنند).
+    *proxy* باید دیکشنری با کلید "server" باشد یا None.
     """
     pw = sync_playwright().start()
     browser = pw.chromium.launch(
@@ -120,7 +90,6 @@ def create_browser_context(url: str, incognito: bool = False, proxy: Optional[Di
         args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
               "--autoplay-policy=no-user-gesture-required"]
     )
-    # تنظیمات context
     context_kwargs = {"viewport": {"width": 390, "height": 844}}
     if proxy:
         context_kwargs["proxy"] = proxy
@@ -213,7 +182,6 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
         page.on("response", _capture_response)
         page.evaluate("window.scrollBy(0, 200)")
         page.wait_for_timeout(1000)
-        # حذف شنونده
         page.remove_listener("response", _capture_response)
 
         seen = set(videos)
@@ -266,7 +234,7 @@ def extract_links(page: Page, mode: str) -> Tuple[List[Tuple[str, str, str]], Li
 
 
 # ---------------------------------------------------------------------------
-# نمایش صفحه‌بندی مرورگر (با API Hunter)
+# نمایش صفحه‌بندی مرورگر
 # ---------------------------------------------------------------------------
 def send_browser_page(chat_id: int, image_path: Optional[str], url: str, page_num: int) -> None:
     """
@@ -580,7 +548,7 @@ def process_browser_job(job: dict) -> None:
     os.makedirs(job_dir, exist_ok=True)
 
     proxy_mode = session["settings"].get("proxy_mode", "off")
-    proxy = get_proxy_dict(proxy_mode)
+    proxy = _get_playwright_proxy(proxy_mode)
 
     pw, browser, context, page = None, None, None, None
     try:
@@ -634,7 +602,7 @@ def process_screenshot_job(job: dict) -> None:
     os.makedirs(job_dir, exist_ok=True)
 
     proxy_mode = session["settings"].get("proxy_mode", "off")
-    proxy = get_proxy_dict(proxy_mode)
+    proxy = _get_playwright_proxy(proxy_mode)
 
     pw, browser, context, page = None, None, None, None
     try:
@@ -694,7 +662,7 @@ def process_download_job(job: dict) -> None:
     if is_direct_file_url(url):
         direct_link = url
     else:
-    	direct_link = crawl_for_download_link(url, max_depth=1, max_pages=10)
+        direct_link = crawl_for_download_link(url, max_depth=1, max_pages=10, proxies=proxy)
 
     if not direct_link:
         process_blind_download(job)
@@ -795,11 +763,11 @@ def process_blind_download(job: dict) -> None:
 def _send_file_parts(chat_id: int, file_path: str, use_zip: bool, label: str = "", compression: str = "normal") -> None:
     """
     ارسال فایل به صورت قطعه‌قطعه (با توجه به ZIP_PART_SIZE و نوع تحویل).
-    اگر use_zip و compression=="high" باشد، از 7z استفاده می‌شود.
+    اگر compression == "high" باشد، مستقیماً با 7z فشرده می‌شود.
     """
     if use_zip:
         if compression == "high":
-            archive_path = compress_7z(file_path)
+            archive_path = compress_7z(file_path)            # مستقیماً 7z روی فایل اصلی
             base = os.path.splitext(os.path.basename(archive_path))[0]
             ext = ".7z"
             parts = split_file_binary(archive_path, base, ext)
@@ -906,7 +874,8 @@ def download_full_website(job: dict) -> None:
     session = storage.get_session(chat_id)
     compression = session["settings"].get("compression_level", "normal")
     proxy_mode = session["settings"].get("proxy_mode", "off")
-    proxy = get_proxy_dict(proxy_mode)
+    proxy_requests = get_proxy_dict(proxy_mode)
+    proxy_playwright = _get_playwright_proxy(proxy_mode)
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
@@ -931,14 +900,11 @@ def download_full_website(job: dict) -> None:
         except Exception:
             pass
 
-    if wget_ok:
-        # ادامه با زیپ و ارسال
-        pass  # از پایین ادامه می‌دهد
-    else:
+    if not wget_ok:
         worker.send_message(chat_id, "wget در دسترس نیست، تلاش با مرورگر...")
         pw = browser = context = page = None
         try:
-            pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+            pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             html = page.content()
@@ -1121,7 +1087,8 @@ def handle_scan_downloads(job: dict) -> None:
         return
 
     deep_mode = session["settings"].get("deep_scan_mode", "logical")
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_requests = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     send_message = worker.send_message
 
     found_links: Set[str] = set()
@@ -1135,7 +1102,7 @@ def handle_scan_downloads(job: dict) -> None:
         size_str = "نامشخص"
         size_bytes = None
         try:
-            head = requests.head(link, timeout=5, allow_redirects=True, proxies=proxy)
+            head = requests.head(link, timeout=5, allow_redirects=True, proxies=proxy_requests)
             if head.headers.get("Content-Length"):
                 size_bytes = int(head.headers.get("Content-Length"))
                 size_str = f"{size_bytes / 1024 / 1024:.2f} MB"
@@ -1150,7 +1117,7 @@ def handle_scan_downloads(job: dict) -> None:
     # مرحله ۱: Playwright
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(1000)
         all_hrefs = page.evaluate("""() => {
@@ -1186,7 +1153,7 @@ def handle_scan_downloads(job: dict) -> None:
         try:
             s = requests.Session()
             s.headers.update({"User-Agent": USER_AGENT})
-            resp = s.get(url, timeout=10, proxies=proxy)
+            resp = s.get(url, timeout=10, proxies=proxy_requests)
             if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
                 soup = BeautifulSoup(resp.text, "html.parser")
                 links_to_crawl = []
@@ -1204,7 +1171,7 @@ def handle_scan_downloads(job: dict) -> None:
                 for link in links_to_crawl[:15]:
                     if time.time() - start_time > 60:
                         break
-                    found = crawl_for_download_link(link, max_depth=1, max_pages=5, timeout_seconds=10, proxies=proxy)
+                    found = crawl_for_download_link(link, max_depth=1, max_pages=5, timeout_seconds=10, proxies=proxy_requests)
                     if found:
                         add_result(found)
                 elapsed = time.time() - start_time
@@ -1234,10 +1201,10 @@ def handle_scan_videos(job: dict) -> None:
         _done_job(job)
         return
 
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         videos = scan_videos_smart(page)
         if not videos:
@@ -1354,10 +1321,10 @@ def handle_source_analyze(job: dict) -> None:
         _done_job(job)
         return
 
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
         html = page.content()
@@ -1444,14 +1411,13 @@ def handle_download_all_found(job: dict) -> None:
             worker.send_message(chat_id, "⛔ هیچ فایلی دانلود نشد.")
         else:
             if compression == "high":
-                # 7z کل پوشه
-                archive_path = compress_7z(job_dir)  # ممکن است کل پوشه را فشرده کند یا فایل‌ها را جداگانه.
-                # اما compress_7z برای یک فایل طراحی شده، لذا بهتر است پوشه را زیپ کنیم و سپس 7z کنیم
-                zip_path = os.path.join(job_dir, "all_found.zip")
-                with zipfile.ZipFile(zip_path, "w") as zf:
+                # ZIP با فشرده‌سازی ذخیره‌شده (بدون فشرده‌سازی) سپس 7z مستقیم روی فایل‌ها
+                temp_zip = os.path.join(job_dir, "temp_stored.zip")
+                with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_STORED) as zf:
                     for f in files:
                         zf.write(f, os.path.basename(f))
-                archive_path = compress_7z(zip_path)
+                archive_path = compress_7z(temp_zip)
+                os.remove(temp_zip)
                 parts = split_file_binary(archive_path, "all_found", ".7z")
             else:
                 zip_path = os.path.join(job_dir, "all_found.zip")
@@ -1499,10 +1465,10 @@ def process_captcha_job(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
         page.evaluate("""
@@ -1553,11 +1519,11 @@ def process_fullpage_screenshot(job: dict) -> None:
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
     session = storage.get_session(chat_id)
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     spath = os.path.join(job_dir, "screenshot.png")
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.screenshot(path=spath, full_page=True)
         worker.send_document(chat_id, spath)
@@ -1586,10 +1552,10 @@ def process_interactive_scan(job: dict) -> None:
         _done_job(job)
         return
 
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         elements = page.evaluate("""
         () => {
@@ -1661,11 +1627,11 @@ def process_interactive_execute(job: dict) -> None:
 
     job_dir = f"jobs/{job['job_id']}"
     os.makedirs(job_dir, exist_ok=True)
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     spath = os.path.join(job_dir, "result.png")
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         selector = target["selector"]
         if not selector:
@@ -1714,11 +1680,11 @@ def process_api_hunter_job(job: dict) -> None:
         _done_job(job)
         return
 
-    proxy = get_proxy_dict(session["settings"].get("proxy_mode", "off"))
+    proxy_playwright = _get_playwright_proxy(session["settings"].get("proxy_mode", "off"))
     pw = browser = context = page = None
     capture = None
     try:
-        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy)
+        pw, browser, context, page = create_browser_context(url, incognito=False, proxy=proxy_playwright)
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
 
