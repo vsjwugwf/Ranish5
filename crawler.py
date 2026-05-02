@@ -303,11 +303,13 @@ class Crawler:
             clickables = page.evaluate(js)
 
             layer_clickable_dir = os.path.join(self.results_dir, f"layer_{layer}", "clickable")
+            os.makedirs(layer_clickable_dir, exist_ok=True)          # ★ تضمین وجود پوشه
             json_path = os.path.join(layer_clickable_dir, "clickable.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(clickables, f, ensure_ascii=False, indent=2)
 
             screenshot_path = os.path.join(self.results_dir, f"layer_{layer}", "screenshots", "page.png")
+            os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)  # ★ تضمین وجود پوشه
             page.screenshot(path=screenshot_path, full_page=True)
 
             self.total_clickables += len(clickables)
@@ -336,7 +338,7 @@ class Crawler:
             page.wait_for_timeout(2000)
 
             downloads_dir = os.path.join(self.results_dir, f"layer_{layer}", "downloads")
-            os.makedirs(downloads_dir, exist_ok=True)
+            os.makedirs(downloads_dir, exist_ok=True)                # ★ تضمین وجود پوشه
             links_list_path = os.path.join(downloads_dir, "links.txt")
             links_file = open(links_list_path, "w", encoding="utf-8")
 
@@ -557,7 +559,9 @@ class Crawler:
                     for item in clickables:
                         href = item.get("href", "")
                         if href and href.startswith("http") and href not in self.visited:
-                            self.queue.append((href, depth + 1))
+                            # تبدیل URL نسبی به مطلق با استفاده از صفحهٔ فعلی
+                            absolute_href = urljoin(url, href)
+                            self.queue.append((absolute_href, depth + 1))
 
             self._finalize()
         except Exception as e:
