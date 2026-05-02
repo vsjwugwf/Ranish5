@@ -130,6 +130,11 @@ def create_zip_and_split(src: str, base: str, compression: str = "normal") -> Li
     dir_name = os.path.dirname(src)
     zip_path = os.path.join(dir_name, f"{base}.zip")
 
+    # اگر فایل اصلی خودش ZIP است و مسیر خروجی با مسیر ورودی یکی می‌شود،
+    # یک نام موقت برای ZIP انتخاب کن تا فایل اصلی از بین نرود
+    if os.path.abspath(zip_path) == os.path.abspath(src):
+        zip_path = os.path.join(dir_name, f"{base}_tmp_{int(time.time())}.zip")
+
     if compression == "high":
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
             zf.write(src, arcname=os.path.basename(src))
