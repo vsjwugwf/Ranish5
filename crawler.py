@@ -108,12 +108,15 @@ class Crawler:
 
         # آمار و وضعیت
         self.visited: Set[str] = set()
-        self.queue: List[Tuple[str, int]] = []   # (url, depth)
+        self.queue: List[Tuple[str, int, int]] = []   # (url, depth, clickable_id)
         self.total_pages = 0
         self.total_clickables = 0
         self.total_files = 0
         self.total_errors = 0
         self.total_size = 0
+
+        # ★ شمارنده سراسری برای هر المان قابل کلیک
+        self.global_clickable_id = 0
 
         self.successful_ops = 0
         self.failed_ops = 0
@@ -232,7 +235,7 @@ class Crawler:
     # -------------------------------------------------------------------
     # راند ۱: اسکن المان‌های قابل کلیک
     # -------------------------------------------------------------------
-    def _scan_clickables(self, url: str, layer: int) -> Optional[List[Dict]]:
+    def _scan_clickables(self, url: str, layer: int, clickable_id: int = 0) -> Optional[List[Dict]]:
         self._respect_delay(url)
         page = None
         try:
@@ -303,22 +306,23 @@ class Crawler:
             clickables = page.evaluate(js)
 
             layer_clickable_dir = os.path.join(self.results_dir, f"layer_{layer}", "clickable")
-            os.makedirs(layer_clickable_dir, exist_ok=True)          # ★ تضمین وجود پوشه
+            os.makedirs(layer_clickable_dir, exist_ok=True)
             json_path = os.path.join(layer_clickable_dir, "clickable.json")
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(clickables, f, ensure_ascii=False, indent=2)
 
             screenshot_path = os.path.join(self.results_dir, f"layer_{layer}", "screenshots", "page.png")
-            os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)  # ★ تضمین وجود پوشه
+            os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
             page.screenshot(path=screenshot_path, full_page=True)
 
             self.total_clickables += len(clickables)
-            self._invoke_callback(f"🔍 راند ۱ لایه {layer} به پایان رسید. {len(clickables)} المان قابل کلیک یافت شد.")
+            id_text = f" (از المان #{clickable_id})" if clickable_id > 0 else ""
+            self._invoke_callback(f"🔍 راند ۱ لایه {layer}{id_text}: {len(clickables)} نقطهٔ قابل کلیک یافت شد.")
             return clickables
         except Exception as e:
             self.total_errors += 1
             self.failed_ops += 1
-            msg = f"خطا در راند ۱ لایه {layer} ({url}): {e}"
+            msg = f"خطا در راند ۱ لایه {layer} (المان #{clickable_id}) ({url}): {e}"
             self._log_error(msg)
             self._invoke_callback(f"❌ {msg}")
             return None
@@ -329,7 +333,7 @@ class Crawler:
     # -------------------------------------------------------------------
     # راند ۲: اسکن و دانلود محتوا
     # -------------------------------------------------------------------
-    def _scan_downloads(self, url: str, layer: int):
+    def _scan_downloads(self, url: str, layer: int, clickable_id: int = 0):
         self._respect_delay(url)
         page = None
         try:
@@ -338,13 +342,15 @@ class Crawler:
             page.wait_for_timeout(2000)
 
             downloads_dir = os.path.join(self.results_dir, f"layer_{layer}", "downloads")
-            os.makedirs(downloads_dir, exist_ok=True)                # ★ تضمین وجود پوشه
+            os.makedirs(downloads_dir, exist_ok=True)
             links_list_path = os.path.join(downloads_dir, "links.txt")
             links_file = open(links_list_path, "w", encoding="utf-8")
 
             downloaded_count = 0
             proxy = self._get_proxy()
             proxies = {"http": proxy["server"], "https": proxy["server"]} if proxy else None
+
+            size_before = self.total_size   # ★ برای محاسبه حجم دانلود شده در این راند
 
             # ----- مرحله ۱: لینک‌های مستقیم از DOM -----
             dom_urls = page.evaluate("""() => {
@@ -425,12 +431,15 @@ class Crawler:
                     links_file.write(hid_url + "\n")
 
             links_file.close()
+            downloaded_bytes_in_this_round = self.total_size - size_before
+            size_mb = downloaded_bytes_in_this_round / (1024 * 1024)
+            id_text = f" (از المان #{clickable_id})" if clickable_id > 0 else ""
             self.total_files += downloaded_count
-            self._invoke_callback(f"📥 راند ۲ لایه {layer} به پایان رسید. {downloaded_count} فایل دانلود شد.")
+            self._invoke_callback(f"📥 راند ۲ لایه {layer}{id_text}: {downloaded_count} فایل ({size_mb:.1f} MB) دانلود شد.")
         except Exception as e:
             self.total_errors += 1
             self.failed_ops += 1
-            msg = f"خطا در راند ۲ لایه {layer} ({url}): {e}"
+            msg = f"خطا در راند ۲ لایه {layer} (المان #{clickable_id}) ({url}): {e}"
             self._log_error(msg)
             self._invoke_callback(f"❌ {msg}")
         finally:
@@ -527,7 +536,8 @@ class Crawler:
             if self.use_sitemap:
                 self._fetch_sitemap()
 
-            self.queue.append((self.start_url, 1))
+            # صف اولیه: (url, depth=1, clickable_id=0)
+            self.queue.append((self.start_url, 1, 0))
 
             while self.queue:
                 if self.stop_event.is_set():
@@ -539,7 +549,7 @@ class Crawler:
                     self._invoke_callback("📄 حد مجاز صفحات بازدیدشده رسید.")
                     break
 
-                url, depth = self.queue.pop(0)
+                url, depth, clickable_id = self.queue.pop(0)
                 if url in self.visited or depth > self.max_depth:
                     continue
 
@@ -547,8 +557,8 @@ class Crawler:
                 self.total_pages += 1
                 self._log_csv(url, "processing", "", "page", depth, "processing")
 
-                clickables = self._scan_clickables(url, depth)
-                self._scan_downloads(url, depth)
+                clickables = self._scan_clickables(url, depth, clickable_id)
+                self._scan_downloads(url, depth, clickable_id)
 
                 if clickables is not None:
                     self.successful_ops += 1
@@ -556,12 +566,16 @@ class Crawler:
                     self.failed_ops += 1
 
                 if clickables and depth < self.max_depth:
+                    new_urls_count = 0
                     for item in clickables:
                         href = item.get("href", "")
                         if href and href.startswith("http") and href not in self.visited:
-                            # تبدیل URL نسبی به مطلق با استفاده از صفحهٔ فعلی
                             absolute_href = urljoin(url, href)
-                            self.queue.append((absolute_href, depth + 1))
+                            self.global_clickable_id += 1
+                            self.queue.append((absolute_href, depth + 1, self.global_clickable_id))
+                            new_urls_count += 1
+                    if new_urls_count > 0:
+                        self._invoke_callback(f"🚀 لایهٔ {depth + 1}: {new_urls_count} لینک جدید برای پردازش اضافه شد.")
 
             self._finalize()
         except Exception as e:
@@ -598,7 +612,8 @@ class Crawler:
                 for loc in soup.find_all("loc"):
                     loc_url = loc.text.strip()
                     if loc_url:
-                        self.queue.append((loc_url, 1))
+                        # sitemap لایه ۱ با شناسه ۰
+                        self.queue.append((loc_url, 1, 0))
             except:
                 pass
 
@@ -633,6 +648,8 @@ class Crawler:
             self.errors_log.close()
 
         self._generate_html_report()
+
+        self._invoke_callback(f"📊 مجموع حجم دانلود شده: {self.total_size / 1024 / 1024:.1f} MB")
 
         # ساخت ZIP نهایی با توجه به فشرده‌سازی
         if self.compression == "high":
