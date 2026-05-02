@@ -1,4 +1,4 @@
-name: Ranish5 Bot
+name: Ranish Bot - 5
 
 on:
   schedule:
@@ -40,7 +40,7 @@ jobs:
       - name: Install Python packages
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4 playwright aiohttp
+          pip install requests beautifulsoup4 playwright aiohttp PySocks
           playwright install --with-deps chromium
 
       - name: Set environment variables
