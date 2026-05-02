@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from settings import ZIP_PART_SIZE, USER_AGENT
-
+import proxy_utils
 
 # ---------------------------------------------------------------------------
 # ۱. تشخیص لینک مستقیم فایل
@@ -312,6 +312,11 @@ def get_proxy_dict(proxy_mode: str) -> Optional[Dict[str, str]]:
     elif proxy_mode == "tor":
         return {"http": "socks5://127.0.0.1:9050", "https": "socks5://127.0.0.1:9050"}
     elif proxy_mode == "free":
-        # یک پروکسی رایگان نمونه – در آینده از proxy_utils خوانده می‌شود
-        return {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"}
+        try:
+            free_proxy = proxy_utils.get_free_proxy()
+            if free_proxy:
+                return {"http": free_proxy, "https": free_proxy}
+        except Exception:
+            pass
+        return None
     return None
