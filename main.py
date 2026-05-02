@@ -22,6 +22,7 @@ import storage
 import worker
 import jobs
 import crawler
+import proxy_utils
 
 # ---------------------------------------------------------------------------
 # راه‌اندازی اولیه
@@ -198,7 +199,7 @@ def _crawler_job_handler(job: dict):
     crawl_settings = extra.get("settings", {})
     stop_ev = threading.Event()
 
-    def progress_callback(msg: str, file_path: str = None):
+    async def progress_callback(msg: str, file_path: str = None):
         if msg == "__FINAL_ZIP__" and file_path:
             file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
             if file_size <= ZIP_PART_SIZE:
@@ -246,11 +247,9 @@ def handle_message(chat_id: int, text: str):
         session["state"] = "idle"
         session["click_counter"] = 0
         session.pop("status_message_id", None)
-        # دیگر browser_links و ... را پاک نکن تا مرورگر پایدار بماند
         storage.set_session(chat_id, session)
 
         sub = session.get("subscription", "free")
-        # ★ فقط کاربران واقعاً free باید کد بزنند
         if is_admin or sub != "free":
             worker.send_message(chat_id, "🤖 ربات آمادهٔ سرویس.", reply_markup=main_menu_keyboard(is_admin, sub))
         else:
@@ -1049,6 +1048,16 @@ def handle_callback(cq: dict):
 # ---------------------------------------------------------------------------
 def main():
     storage.load_subscriptions()
+
+    # راه‌اندازی پروکسی بر اساس تنظیمات ادمین
+    try:
+        admin_session = storage.get_session(ADMIN_CHAT_ID)
+        proxy_mode = admin_session.get("settings", {}).get("proxy_mode", "off")
+        if proxy_mode != "off":
+            proxy_utils.start_proxy(proxy_mode)
+    except Exception as e:
+        safe_log(f"خطا در راه‌اندازی پروکسی: {e}")
+
     workers = worker.start_workers(stop_event)
     offset = 0
     print("[Main] ربات اجرا شد. منتظر دریافت پیام...")
@@ -1085,6 +1094,15 @@ def main():
 
     for t in workers:
         t.join(timeout=2)
+
+    # توقف پروکسی در صورت فعال بودن
+    try:
+        admin_session = storage.get_session(ADMIN_CHAT_ID)
+        proxy_mode = admin_session.get("settings", {}).get("proxy_mode", "off")
+        if proxy_mode != "off":
+            proxy_utils.stop_proxy(proxy_mode)
+    except Exception as e:
+        safe_log(f"خطا در توقف پروکسی: {e}")
 
 if __name__ == "__main__":
     main()
